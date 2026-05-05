@@ -151,7 +151,12 @@ def merge_to_main(bug_id: int, file_rel: str, old: str, new: str, message: str):
 
 
 def _push_if_remote_configured(repo: Path) -> None:
-    """Push HEAD to origin if it exists. Best-effort — never raises."""
+    """Push HEAD to origin if it exists. Best-effort — never raises.
+
+    If a plain push is rejected (the remote has diverged because the local
+    state was reset between demos), fetch + rebase onto origin and push
+    again. This keeps GitHub history monotonically growing.
+    """
     try:
         remotes = subprocess.run(
             ["git", "remote"], cwd=repo, capture_output=True, text=True, check=True
@@ -160,11 +165,39 @@ def _push_if_remote_configured(repo: Path) -> None:
         return
     if "origin" not in remotes:
         return
+
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo, capture_output=True, text=True,
+    ).stdout.strip() or "main"
+
+    push = subprocess.run(
+        ["git", "push", "origin", "HEAD"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    if push.returncode == 0:
+        return
+
+    # Diverged — try fetch + rebase + push.
     try:
-        _git(repo, "push", "origin", "HEAD")
+        subprocess.run(
+            ["git", "fetch", "-q", "origin"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "rebase", f"origin/{branch}"],
+            cwd=repo, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "push", "origin", "HEAD"],
+            cwd=repo, check=True, capture_output=True, text=True,
+        )
     except subprocess.CalledProcessError:
-        # Network down, auth missing, branch protection — log silently.
-        pass
+        # Conflict during rebase or push still failed — bail out cleanly.
+        subprocess.run(
+            ["git", "rebase", "--abort"],
+            cwd=repo, capture_output=True,
+        )
 
 
 def diff_for_branch(workdir: Path) -> str:

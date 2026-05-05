@@ -4,6 +4,7 @@ const MAP: Record<BugStatus, { label: string; cls: string }> = {
   DETECTED:          { label: "DETECTED",      cls: "bg-rose-500/10 text-rose-300 border-rose-500/30" },
   AI_ANALYZING:      { label: "AI ANALYZING",  cls: "bg-violet-500/10 text-violet-300 border-violet-500/30" },
   SANDBOX_APPLYING:  { label: "SANDBOX RUNNING",cls: "bg-amber-500/10 text-amber-300 border-amber-500/30" },
+  VERIFYING_FIX:     { label: "RE-RUNNING TEST",cls: "bg-amber-500/10 text-amber-300 border-amber-500/30" },
   FIX_READY:         { label: "IN REVIEW",     cls: "bg-cyan-500/10 text-cyan-300 border-cyan-500/30" },
   FIX_FAILED:        { label: "FIX FAILED",    cls: "bg-rose-700/15 text-rose-300 border-rose-700/40" },
   MERGED:            { label: "AUTO-FIXED",    cls: "bg-emerald-500/10 text-emerald-300 border-emerald-500/30" },

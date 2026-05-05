@@ -62,6 +62,8 @@ export const api = {
     http<Run>("/api/runs", { method: "POST", body: JSON.stringify({ suite }) }),
   approve: (uid: string) => http<Bug>(`/api/bugs/${uid}/approve`, { method: "POST" }),
   reject:  (uid: string) => http<Bug>(`/api/bugs/${uid}/reject`,  { method: "POST" }),
+  autoFix: (uid: string) =>
+    http<{ status: string; uid: string }>(`/api/bugs/${uid}/auto-fix`, { method: "POST" }),
   screenshotUrl: (name: string) => `/api/screenshots/${name}`,
 
   // ---- manual bugs

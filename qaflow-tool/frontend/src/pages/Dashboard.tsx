@@ -88,7 +88,7 @@ export default function Dashboard() {
 
       {role === "developer" && (
         <section className="grid grid-cols-2 md:grid-cols-3 gap-4">
-          <Kpi value={summary?.pending ?? "—"} label="AI Approvals Pending" color="border-cyan-500/30 bg-cyan-500/5 text-cyan-300" to="/ai-approvals" />
+          <Kpi value={summary?.app_approvals_pending ?? 0} label="App Fixes Awaiting You" color="border-cyan-500/30 bg-cyan-500/5 text-cyan-300" to="/ai-bugs" />
           <Kpi value={summary?.manual_assigned_to_me ?? manualBugs.length} label="Tickets Assigned" color="border-rose-500/30 bg-rose-500/5 text-rose-300" to="/my-tickets" />
           <Kpi value={summary?.auto_fixed ?? "—"} label="Merged Today" color="border-emerald-500/30 bg-emerald-500/5 text-emerald-300" />
         </section>
@@ -96,9 +96,9 @@ export default function Dashboard() {
 
       {role === "automation_engineer" && (
         <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <Kpi value={summary?.active_bugs ?? "—"} label="Active AI Bugs" color="border-rose-500/30 bg-rose-500/5 text-rose-300" to="/ai-bugs" />
-          <Kpi value={summary?.last_run?.total ?? "—"} label="Tests in last run" color="border-cyan-500/30 bg-cyan-500/5 text-cyan-300" />
-          <Kpi value={summary?.last_run?.failed ?? "—"} label="Failed last run" color="border-amber-500/30 bg-amber-500/5 text-amber-300" />
+          <Kpi value={summary?.test_approvals_pending ?? 0} label="Test Fixes Awaiting You" color="border-cyan-500/30 bg-cyan-500/5 text-cyan-300" to="/ai-bugs" />
+          <Kpi value={summary?.last_cypress_run?.total ?? summary?.last_run?.total ?? "—"} label="Tests in last run" color="border-violet-500/30 bg-violet-500/5 text-violet-300" />
+          <Kpi value={summary?.last_cypress_run?.failed ?? summary?.last_run?.failed ?? "—"} label="Failed last run" color="border-amber-500/30 bg-amber-500/5 text-amber-300" />
           <Kpi value={`${summary?.pass_rate ?? 0}%`} label="Pass Rate" color="border-emerald-500/30 bg-emerald-500/5 text-emerald-300" />
         </section>
       )}

@@ -2,18 +2,20 @@ export type BugStatus =
   | "DETECTED"
   | "AI_ANALYZING"
   | "SANDBOX_APPLYING"
+  | "VERIFYING_FIX"
   | "FIX_READY"
   | "FIX_FAILED"
   | "MERGED"
   | "REJECTED";
 
 export interface Fix {
-  mode: "mock" | "claude";
+  mode: "mock" | "claude" | "rule-based";
   bug_id: number;
   title: string;
   type: string;
   severity: string;
   file: string;
+  target_repo?: "buggy-app" | "cypress-tests";
   analysis: string;
   old: string;
   new: string;
@@ -39,6 +41,11 @@ export interface Bug {
   merged_at?: string;
   rejected_at?: string;
   merge_skipped?: boolean;
+  source?: "ai" | "cypress";
+  spec?: string;
+  test_name?: string;
+  failure_screenshot?: string | null;
+  verification?: { passed: boolean; duration_s?: number };
 }
 
 export type RunStatus =
@@ -69,6 +76,9 @@ export interface DashboardSummary {
   pass_rate: number;
   ai_mode: "mock" | "claude";
   last_run: Run | null;
+  last_cypress_run?: CypressRun | null;
+  app_approvals_pending?: number;
+  test_approvals_pending?: number;
   manual_open: number;
   manual_assigned_to_me: number;
   manual_reported_by_me: number;

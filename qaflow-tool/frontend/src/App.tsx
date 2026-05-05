@@ -4,6 +4,7 @@ import { useAuth } from "./AuthContext";
 import { useLiveData } from "./useLiveData";
 import Sidebar from "./components/Sidebar";
 import ProtectedRoute from "./components/ProtectedRoute";
+import NotificationBell from "./components/NotificationBell";
 
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
@@ -55,6 +56,9 @@ function AppShell() {
     <div className="flex h-full">
       <Sidebar aiMode={summary?.ai_mode || "mock"} connected={connected} />
       <main className="flex-1 overflow-y-auto px-8 py-6">
+        <div className="flex items-center justify-end mb-4">
+          <NotificationBell />
+        </div>
         <Routes>
           <Route path="/" element={<Dashboard />} />
 
@@ -64,7 +68,7 @@ function AppShell() {
           <Route path="/test-runner" element={<ProtectedRoute roles={["project_manager", "automation_engineer"]}><TestRunner /></ProtectedRoute>} />
           <Route path="/cypress-runs" element={<ProtectedRoute><CypressRuns /></ProtectedRoute>} />
           <Route path="/cypress-runs/:id" element={<ProtectedRoute><CypressRunDetail /></ProtectedRoute>} />
-          <Route path="/reports" element={<ProtectedRoute roles={["project_manager"]}><Reports /></ProtectedRoute>} />
+          <Route path="/reports" element={<ProtectedRoute roles={["project_manager", "automation_engineer"]}><Reports /></ProtectedRoute>} />
           <Route path="/ai-approvals" element={<ProtectedRoute roles={["developer"]}><AIApprovals /></ProtectedRoute>} />
 
           {/* Manual bug routes */}
