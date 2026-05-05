@@ -13,6 +13,7 @@ export class LoginPage {
   fillForm(email, password) {
     if (email    !== undefined) this.emailInput().clear().type(email);
     if (password !== undefined) this.passwordInput().clear().type(password);
+    return this;
   }
   submit() { this.submitBtn().click(); }
   loginAs(email, password) { this.fillForm(email, password); this.submit(); }
