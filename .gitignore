@@ -1,0 +1,30 @@
+# --- Dependencies ---
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# --- Build / runtime artifacts ---
+.logs/
+.pids/
+*.log
+qaflow-tool/backend/qaflow.sqlite3
+qaflow-tool/backend/sandbox_workspace/
+qaflow-tool/backend/screenshots/
+cypress-tests/cypress/screenshots/
+cypress-tests/cypress/videos/
+cypress-tests/cypress/downloads/
+cypress-tests/results.json
+
+# --- buggy-app is its own GitHub repo ---
+buggy-app/
+
+# --- IDE / OS ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- Secrets ---
+.env
+.env.local

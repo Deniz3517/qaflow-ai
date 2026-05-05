@@ -1,0 +1,16 @@
+{
+  "name": "qaflow-cypress-tests",
+  "version": "1.0.0",
+  "description": "End-to-end Cypress test suite for the SportHub demo store",
+  "private": true,
+  "scripts": {
+    "cypress:open":   "cypress open",
+    "cypress:run":    "cypress run --browser chrome",
+    "test":           "cypress run --browser chrome --reporter json --reporter-options output=results.json",
+    "test:headed":    "cypress run --browser chrome --headed",
+    "test:smoke":     "cypress run --browser chrome --spec 'cypress/e2e/01_smoke.cy.js'"
+  },
+  "devDependencies": {
+    "cypress": "13.6.6"
+  }
+}

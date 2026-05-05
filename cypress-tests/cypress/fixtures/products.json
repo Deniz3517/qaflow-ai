@@ -1,0 +1,16 @@
+{
+  "totalCount": 12,
+  "categories": ["Running", "Football", "Basketball", "Fitness", "Apparel"],
+  "perCategory": {
+    "Running":    2,
+    "Football":   2,
+    "Basketball": 2,
+    "Fitness":    3,
+    "Apparel":    3
+  },
+  "featuredIds": [1, 5, 8, 10],
+  "demoCredentials": {
+    "email":    "demo@sporthub.com",
+    "password": "demo1234"
+  }
+}

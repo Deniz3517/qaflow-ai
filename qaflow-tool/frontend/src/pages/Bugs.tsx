@@ -1,0 +1,60 @@
+import { Link } from "react-router-dom";
+import { useLiveData } from "../useLiveData";
+import StatusBadge from "../components/StatusBadge";
+
+export default function Bugs() {
+  const { bugs } = useLiveData();
+  const bugList = Object.values(bugs).sort(
+    (a, b) => +new Date(b.created_at) - +new Date(a.created_at),
+  );
+
+  return (
+    <div className="space-y-6">
+      <header>
+        <h1 className="text-2xl font-semibold text-ink-100">Bug Tracker</h1>
+        <p className="text-sm text-ink-400 mt-0.5">
+          All detected bugs across every run.
+        </p>
+      </header>
+
+      <div className="rounded-lg border border-ink-700 bg-ink-800/40 overflow-hidden">
+        {bugList.length === 0 ? (
+          <div className="p-12 text-center text-ink-400 text-sm">No bugs recorded yet.</div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="bg-ink-900/40 text-xs uppercase tracking-wider text-ink-400">
+              <tr>
+                <th className="text-left px-5 py-2 font-medium">ID</th>
+                <th className="text-left px-5 py-2 font-medium">Title</th>
+                <th className="text-left px-5 py-2 font-medium">Type</th>
+                <th className="text-left px-5 py-2 font-medium">Branch</th>
+                <th className="text-left px-5 py-2 font-medium">Status</th>
+                <th className="text-left px-5 py-2 font-medium">Confidence</th>
+                <th className="text-right px-5 py-2 font-medium"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {bugList.map((b) => (
+                <tr key={b.uid} className="border-t border-ink-700/60 hover:bg-ink-700/20">
+                  <td className="px-5 py-2.5 font-mono text-ink-400">#{b.id}</td>
+                  <td className="px-5 py-2.5 text-ink-100">{b.title}</td>
+                  <td className="px-5 py-2.5 text-ink-400 text-xs uppercase tracking-wide">{b.type}</td>
+                  <td className="px-5 py-2.5 font-mono text-xs text-cyan-400">{b.branch}</td>
+                  <td className="px-5 py-2.5"><StatusBadge status={b.status} /></td>
+                  <td className="px-5 py-2.5 font-mono text-xs text-ink-300">
+                    {b.fix ? `${b.fix.confidence}%` : "—"}
+                  </td>
+                  <td className="px-5 py-2.5 text-right">
+                    <Link to={`/bugs/${b.uid}`} className="text-emerald-400 hover:text-emerald-300 text-xs font-semibold">
+                      Review →
+                    </Link>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
