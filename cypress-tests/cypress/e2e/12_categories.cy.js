@@ -16,7 +16,7 @@ describe("12 Category cards — names, links and click navigation", () => {
 
   NAMES.forEach((name) => {
     it(`category card "${name}" links to /products.html?cat=${name}`, () => {
-      home.categoryCards().contains(name)
+      home.categoryCards().contains(name).parents(".cat-card")
         .should("have.attr", "href", `/products.html?cat=${name}`);
     });
   });
