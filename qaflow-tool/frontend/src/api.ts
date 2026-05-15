@@ -1,4 +1,24 @@
-import type { Bug, CypressRun, DashboardSummary, ManualBug, Run, User } from "./types";
+import type {
+  AuthConfig,
+  Bug,
+  CoverageEstimate,
+  CrawlResult,
+  CypressRun,
+  DashboardSummary,
+  InstallStatus,
+  ManualBug,
+  QualityScore,
+  RegenDiff,
+  Run,
+  RunResult,
+  SavedBundle,
+  TestCoverGenerateRequest,
+  TestCoverGenerateResult,
+  TestCoverProject,
+  TestCoverScan,
+  TestFrameworkInfo,
+  User,
+} from "./types";
 
 const TOKEN_KEY = "qaflow_token";
 
@@ -64,6 +84,64 @@ export const api = {
   reject:  (uid: string) => http<Bug>(`/api/bugs/${uid}/reject`,  { method: "POST" }),
   autoFix: (uid: string) =>
     http<{ status: string; uid: string }>(`/api/bugs/${uid}/auto-fix`, { method: "POST" }),
+
+  // AI Test Cover Engine
+  scanForTests: (url: string, opts?: { auth?: AuthConfig; capture_baseline?: boolean }) =>
+    http<TestCoverScan & { baseline_screenshot_b64?: string }>(
+      "/api/ai/test-writer/scan",
+      { method: "POST", body: JSON.stringify({ url, ...(opts || {}) }) },
+    ),
+  crawlForTests: (payload: {
+    url: string; max_pages?: number; same_origin?: boolean; auth?: AuthConfig;
+  }) =>
+    http<CrawlResult>("/api/ai/test-writer/crawl", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  coverageEstimate: (scan: TestCoverScan, focus: string[]) =>
+    http<CoverageEstimate>("/api/ai/test-writer/coverage", {
+      method: "POST", body: JSON.stringify({ scan, test_focus: focus }),
+    }),
+  scoreFiles: (files: Record<string, string>) =>
+    http<QualityScore>("/api/ai/test-writer/score", {
+      method: "POST", body: JSON.stringify({ files }),
+    }),
+  diffAgainstBundle: (payload: {
+    files: Record<string, string>; framework: string; project: string; env?: string;
+  }) =>
+    http<RegenDiff>("/api/ai/test-writer/diff", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  runSuite: (payload: { framework: string; project: string; env?: string }) =>
+    http<RunResult>("/api/ai/test-writer/run", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  generateTests: (payload: TestCoverGenerateRequest) =>
+    http<TestCoverGenerateResult>("/api/ai/test-writer/generate", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  saveBundle: (payload: {
+    files: Record<string, string>;
+    framework: string;
+    project: string;
+    env?: string;
+    baseline_b64?: string;
+  }) =>
+    http<SavedBundle>("/api/ai/test-writer/save", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  listTestProjects: () =>
+    http<TestCoverProject[]>("/api/ai/test-writer/projects"),
+
+  listFrameworks: () =>
+    http<TestFrameworkInfo[]>("/api/ai/test-writer/frameworks"),
+  installFramework: (id: string) =>
+    http<{ framework_id: string; status: string }>(
+      `/api/ai/test-writer/frameworks/${id}/install`,
+      { method: "POST" },
+    ),
+  installStatus: (id: string) =>
+    http<InstallStatus>(`/api/ai/test-writer/frameworks/${id}/install-status`),
   screenshotUrl: (name: string) => `/api/screenshots/${name}`,
 
   // ---- manual bugs

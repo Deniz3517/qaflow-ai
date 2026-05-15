@@ -203,3 +203,132 @@ def _push_if_remote_configured(repo: Path) -> None:
 def diff_for_branch(workdir: Path) -> str:
     out = _git(workdir, "diff", "main", "--unified=3")
     return out.stdout
+
+
+# ---------------------------------------------------------------------------
+# Live-repo branch flow (for the auto-fix → review → merge demo)
+#
+# Instead of editing main directly, the auto-fix pipeline now:
+#   1. branches off main on the LIVE buggy-app repo,
+#   2. commits the patch on that branch and pushes it to origin,
+#   3. switches back to main (live server returns to the buggy state),
+#   4. on approve we merge the branch into main and push,
+#   5. on reject we delete the branch.
+#
+# Multiple parallel auto-fixes would corrupt this dance, so callers must
+# serialize them per-repo.
+# ---------------------------------------------------------------------------
+
+
+def current_branch(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def open_live_branch(repo: Path, branch: str) -> None:
+    """Create (or reset) `branch` from main and check it out on the live repo."""
+    _git(repo, "checkout", "-q", "main")
+    # If the branch already exists locally, blow it away — auto-fix is the
+    # source of truth for these throwaway demo branches.
+    existing = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", branch],
+        cwd=repo, capture_output=True, text=True,
+    )
+    if existing.returncode == 0:
+        _git(repo, "branch", "-D", branch)
+    _git(repo, "checkout", "-q", "-b", branch)
+
+
+def commit_and_push_branch(
+    repo: Path, branch: str, file_rel: str, message: str,
+) -> bool:
+    """Stage a single file, commit on the current branch, and push the branch.
+
+    Returns True if a commit was created.
+    """
+    _git(repo, "add", "--", file_rel)
+    res = subprocess.run(
+        ["git", "commit", "-q", "-m", message],
+        cwd=repo, capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return False
+    _push_branch(repo, branch)
+    return True
+
+
+def _push_branch(repo: Path, branch: str) -> None:
+    """Push `branch` to origin (force-with-lease so demo reruns succeed)."""
+    try:
+        remotes = subprocess.run(
+            ["git", "remote"], cwd=repo, capture_output=True, text=True, check=True,
+        ).stdout.split()
+    except subprocess.CalledProcessError:
+        return
+    if "origin" not in remotes:
+        return
+    subprocess.run(
+        ["git", "push", "--force-with-lease", "origin", branch],
+        cwd=repo, capture_output=True, text=True,
+    )
+
+
+def back_to_main(repo: Path) -> None:
+    """Switch back to main, discarding any uncommitted working-tree state."""
+    _git(repo, "checkout", "-q", "--", ".")
+    _git(repo, "checkout", "-q", "main")
+
+
+def merge_branch_into_main(repo: Path, branch: str) -> bool:
+    """Fast-forward merge `branch` into main, push, and delete the branch.
+
+    Returns True if main moved forward.
+    """
+    _git(repo, "checkout", "-q", "main")
+    before = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=repo, capture_output=True, text=True,
+    ).stdout.strip()
+    res = subprocess.run(
+        ["git", "merge", "--ff", branch],
+        cwd=repo, capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        # FF wasn't possible — fall back to a no-ff merge so we still capture history.
+        subprocess.run(
+            ["git", "merge", "--no-ff", "-m", f"Merge branch '{branch}'", branch],
+            cwd=repo, capture_output=True, text=True,
+        )
+    after = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=repo, capture_output=True, text=True,
+    ).stdout.strip()
+    if after == before:
+        return False
+    _push_if_remote_configured(repo)
+    # Cleanup: branch is merged, drop it.
+    _git(repo, "branch", "-d", branch)
+    _delete_remote_branch(repo, branch)
+    return True
+
+
+def discard_branch(repo: Path, branch: str) -> None:
+    """Delete `branch` locally and on origin (used when dev rejects a fix)."""
+    cur = current_branch(repo)
+    if cur == branch:
+        _git(repo, "checkout", "-q", "main")
+    subprocess.run(
+        ["git", "branch", "-D", branch],
+        cwd=repo, capture_output=True, text=True,
+    )
+    _delete_remote_branch(repo, branch)
+
+
+def _delete_remote_branch(repo: Path, branch: str) -> None:
+    try:
+        subprocess.run(
+            ["git", "push", "origin", "--delete", branch],
+            cwd=repo, capture_output=True, text=True,
+        )
+    except Exception:
+        pass

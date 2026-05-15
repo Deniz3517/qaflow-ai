@@ -19,6 +19,7 @@ import ManualBugDetail from "./pages/ManualBugDetail";
 import ReportBug from "./pages/ReportBug";
 import AIApprovals from "./pages/AIApprovals";
 import AIBugQA from "./pages/AIBugQA";
+import AITestCover from "./pages/AITestCover";
 import Team from "./pages/Team";
 import Placeholder from "./pages/Placeholder";
 
@@ -69,6 +70,7 @@ function AppShell() {
           <Route path="/cypress-runs" element={<ProtectedRoute><CypressRuns /></ProtectedRoute>} />
           <Route path="/cypress-runs/:id" element={<ProtectedRoute><CypressRunDetail /></ProtectedRoute>} />
           <Route path="/reports" element={<ProtectedRoute roles={["project_manager", "automation_engineer"]}><Reports /></ProtectedRoute>} />
+          <Route path="/ai-test-cover" element={<ProtectedRoute roles={["automation_engineer", "project_manager"]}><AITestCover /></ProtectedRoute>} />
           <Route path="/ai-approvals" element={<ProtectedRoute roles={["developer"]}><AIApprovals /></ProtectedRoute>} />
 
           {/* Manual bug routes */}

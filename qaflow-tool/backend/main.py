@@ -41,12 +41,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 import ai_engine
+import audit
 import auth
 import cypress_fix_catalog
 import cypress_runner
 import db
+import frameworks
+import hooks
+import llm_cache
 import sandbox
 import test_runner
+import test_writer
 
 # ---------------------------------------------------------------------------
 # Config & app
@@ -281,6 +286,7 @@ def _process_run(run_id: str, loop: asyncio.AbstractEventLoop):
             state["bugs"][bug_uid] = bug
             bug_uids.append(bug_uid)
             emit({"type": "bug.created", "bug": bug})
+            hooks.fire("on_bug_detected", bug)
 
             try:
                 bug["status"] = "AI_ANALYZING"
@@ -408,6 +414,7 @@ def _process_auto_fix(bug_uid: str, loop: asyncio.AbstractEventLoop):
                         spec_path,
                         sandbox.BUGGY_APP,
                         cypress_runner.CYPRESS_DIR,
+                        bug_uid=bug_uid,
                     )
                     fix_mode = "claude"
                 except Exception as e:
@@ -456,13 +463,38 @@ def _process_auto_fix(bug_uid: str, loop: asyncio.AbstractEventLoop):
             emit()
             return
 
+        # Take a BEFORE screenshot of the page where the bug visually shows.
+        screenshot_url = fix.get("screenshot_url")
+        if screenshot_url:
+            try:
+                before_path = SCREENSHOT_DIR / f"bug-{bug_uid}-before.png"
+                test_runner.screenshot_sync(screenshot_url, before_path)
+                bug["before_screenshot"] = before_path.name
+                emit()
+            except Exception:
+                pass  # non-fatal — fix flow continues without screenshot
+
         bug["status"] = "SANDBOX_APPLYING"
         emit()
+
+        # Branch flow only applies to the buggy-app — cypress-tests fixes still
+        # commit straight to the qaflow-ai monorepo on main.
+        is_app_fix = fix["target_repo"] == "buggy-app"
+        branch_name = f"qaflow/bug-{bug['id']}" if is_app_fix else None
+        if is_app_fix:
+            try:
+                sandbox.open_live_branch(sandbox.BUGGY_APP, branch_name)
+            except subprocess.CalledProcessError as e:
+                bug["status"] = "FIX_FAILED"
+                bug["error"] = f"branch_open_failed: {e.stderr or e}"
+                emit()
+                return
+            bug["branch"] = branch_name
 
         new_text = original_text.replace(fix["old"], fix["new"], 1)
         target_file.write_text(new_text)
 
-        # Verify by re-running the failing spec.
+        # Verify by re-running the failing spec while the patch is on disk.
         bug["status"] = "VERIFYING_FIX"
         emit()
 
@@ -472,6 +504,9 @@ def _process_auto_fix(bug_uid: str, loop: asyncio.AbstractEventLoop):
             bug["status"] = "FIX_FAILED"
             bug["error"] = "no spec recorded for bug — cannot verify"
             target_file.write_text(original_text)
+            if is_app_fix:
+                try: sandbox.back_to_main(sandbox.BUGGY_APP)
+                except Exception: pass
             emit()
             return
 
@@ -482,13 +517,19 @@ def _process_auto_fix(bug_uid: str, loop: asyncio.AbstractEventLoop):
         )
 
         if not passes:
-            target_file.write_text(original_text)  # revert
             bug["status"] = "FIX_FAILED"
             bug["error"] = "fix applied but the test still fails — reverted"
             bug["verification"] = {
                 "passed": False,
                 "duration_s": result.get("duration_s"),
             }
+            target_file.write_text(original_text)
+            if is_app_fix:
+                try:
+                    sandbox.back_to_main(sandbox.BUGGY_APP)
+                    sandbox.discard_branch(sandbox.BUGGY_APP, branch_name)
+                except Exception:
+                    pass
             emit()
             return
 
@@ -497,11 +538,55 @@ def _process_auto_fix(bug_uid: str, loop: asyncio.AbstractEventLoop):
             "passed": True,
             "duration_s": result.get("duration_s"),
         }
+
+        # Take the AFTER screenshot while the patched file is still on disk.
+        if screenshot_url:
+            try:
+                after_path = SCREENSHOT_DIR / f"bug-{bug_uid}-after.png"
+                test_runner.screenshot_sync(screenshot_url, after_path)
+                bug["after_screenshot"] = after_path.name
+            except Exception:
+                pass
+
+        if is_app_fix:
+            try:
+                sandbox.commit_and_push_branch(
+                    sandbox.BUGGY_APP,
+                    branch_name,
+                    fix["file"],
+                    f"fix(bug/{bug['id']}): {fix['title']}",
+                )
+                bug["branch_pushed"] = True
+            except subprocess.CalledProcessError as e:
+                bug["branch_pushed"] = False
+                bug["error"] = f"branch_push_failed: {e.stderr or e}"
+            # Switch the live working tree back to main so the buggy-app server
+            # serves the unfixed version until the dev approves the merge.
+            try:
+                sandbox.back_to_main(sandbox.BUGGY_APP)
+            except Exception:
+                pass
+
         bug["status"] = "FIX_READY"
         emit()
+        hooks.fire("on_fix_ready", bug, bug["fix"])
+
+        # Audit the whole auto-fix pipeline (catalog or claude already
+        # logged inside ai_engine; this captures the rules-only path).
+        if fix_mode == "rule-based":
+            audit.record(
+                "cypress_fix", success=True,
+                bug_uid=bug_uid, engine="rule-based",
+                summary=f"target={fix.get('target_repo')} file={fix.get('file')}",
+            )
 
     except Exception as e:
         bug["status"] = "FIX_FAILED"
+        audit.record(
+            "cypress_fix", success=False,
+            bug_uid=bug_uid, engine="unknown",
+            error=f"{type(e).__name__}: {e}",
+        )
         bug["error"] = f"{type(e).__name__}: {e}"
         emit()
 
@@ -608,7 +693,13 @@ async def _watch_buggy_app():
 
 @app.on_event("startup")
 async def _startup():
-    """Initialise the buggy-app HEAD baseline and launch the watcher."""
+    """Initialise sqlite tables, hook subscribers, and the buggy-app watcher."""
+    # Migration: create the AI infra tables on first boot.
+    audit.init()
+    llm_cache.init()
+    # Default hook subscribers (audit + log).
+    hooks.install_defaults()
+
     try:
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -651,7 +742,14 @@ async def approve_bug(
         )
 
     fix = bug["fix"]
-    if bug.get("source") == "cypress":
+    target_repo = fix.get("target_repo") or "buggy-app"
+    branch = bug.get("branch")
+
+    if bug.get("source") == "cypress" and target_repo == "buggy-app" and branch:
+        # Branch flow: fast-forward merge the bug branch into main + push.
+        merged = sandbox.merge_branch_into_main(sandbox.BUGGY_APP, branch)
+    elif bug.get("source") == "cypress":
+        # cypress-tests target — commit straight to the monorepo.
         merged = _merge_cypress_fix(bug, fix)
     else:
         merged = sandbox.merge_to_main(
@@ -666,6 +764,7 @@ async def approve_bug(
     bug["merged_by"] = user["username"]
     bug["merge_skipped"] = not merged
     await _broadcast({"type": "bug.update", "bug": bug})
+    hooks.fire("on_merged", bug, fix, merged)
 
     # When a developer ships an app change, kick off cypress to surface any
     # tests that drifted — those become bugs auto-routed to the AE.
@@ -706,8 +805,309 @@ async def reject_bug(
     bug["status"] = "REJECTED"
     bug["rejected_at"] = _now_iso()
     bug["rejected_by"] = user["username"]
+
+    # Discard the throwaway fix branch (locally + on origin) so the repo
+    # doesn't accumulate stale auto-fix branches.
+    branch = bug.get("branch")
+    target_repo = (bug.get("fix") or {}).get("target_repo")
+    if branch and target_repo == "buggy-app":
+        try:
+            sandbox.discard_branch(sandbox.BUGGY_APP, branch)
+        except Exception:
+            pass
+
     await _broadcast({"type": "bug.update", "bug": bug})
     return bug
+
+
+# ---------------------------------------------------------------------------
+# AI Test Cover Engine (automation_engineer)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/ai/test-writer/scan")
+async def ai_test_writer_scan(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    payload = payload or {}
+    url = payload.get("url", "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "url must start with http:// or https://")
+    auth_cfg = payload.get("auth")  # optional login flow
+    capture_baseline = bool(payload.get("capture_baseline", False))
+    loop = asyncio.get_running_loop()
+    try:
+        scan = await loop.run_in_executor(
+            None, test_writer.scan_page, url, auth_cfg, capture_baseline,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"scan failed: {type(e).__name__}: {e}")
+    return scan
+
+
+@app.post("/api/ai/test-writer/crawl")
+async def ai_test_writer_crawl(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    payload = payload or {}
+    url = payload.get("url", "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "url must start with http:// or https://")
+    max_pages = int(payload.get("max_pages") or 8)
+    same_origin = bool(payload.get("same_origin", True))
+    auth_cfg = payload.get("auth")
+    loop = asyncio.get_running_loop()
+    try:
+        pages = await loop.run_in_executor(
+            None, test_writer.crawl_pages, url, max_pages, same_origin, auth_cfg,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"crawl failed: {type(e).__name__}: {e}")
+    return {"pages": pages, "count": len(pages)}
+
+
+@app.post("/api/ai/test-writer/coverage")
+async def ai_test_writer_coverage(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Estimate which tests a generation would produce — call after /scan."""
+    scan = (payload or {}).get("scan")
+    focus = (payload or {}).get("test_focus") or ["smoke"]
+    if not scan:
+        raise HTTPException(400, "scan is required")
+    return test_writer.estimate_coverage(scan, focus)
+
+
+@app.post("/api/ai/test-writer/score")
+async def ai_test_writer_score(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Quality scorecard for an arbitrary {files: {...}} bundle."""
+    files = (payload or {}).get("files")
+    if not files or not isinstance(files, dict):
+        raise HTTPException(400, "files (dict) is required")
+    return test_writer.score_suite({str(k): str(v) for k, v in files.items()})
+
+
+@app.post("/api/ai/test-writer/diff")
+async def ai_test_writer_diff(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Compare a fresh generation against the previous bundle on disk."""
+    payload = payload or {}
+    files = payload.get("files")
+    if not files or not isinstance(files, dict):
+        raise HTTPException(400, "files (dict) is required")
+    project = payload.get("project")
+    framework = payload.get("framework", "cypress-js")
+    env = payload.get("env")
+    if not project:
+        raise HTTPException(400, "project is required")
+    return test_writer.diff_against_existing(
+        framework, project, env,
+        {str(k): str(v) for k, v in files.items()},
+    )
+
+
+@app.post("/api/ai/test-writer/run")
+async def ai_test_writer_run(
+    payload: dict,
+    user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Execute a saved bundle in its framework's runner."""
+    payload = payload or {}
+    project = payload.get("project")
+    framework = payload.get("framework", "cypress-js")
+    env = payload.get("env")
+    if not project:
+        raise HTTPException(400, "project is required")
+    timeout_s = int(payload.get("timeout_s") or 300)
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, test_writer.run_suite, framework, project, env, timeout_s,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"run failed: {type(e).__name__}: {e}")
+    audit.record(
+        "test_writer_run", success=result["exit_code"] == 0,
+        framework_id=result.get("framework_id"),
+        engine="runner",
+        duration_ms=int(result["duration_s"] * 1000),
+        summary=f"{result.get('passed','?')}/{(result.get('passed') or 0) + (result.get('failed') or 0)} passed",
+    )
+    return result
+
+
+@app.post("/api/ai/test-writer/generate")
+async def ai_test_writer_generate(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    if not payload or "url" not in payload:
+        raise HTTPException(400, "url is required")
+
+    opts = test_writer.GenerateOptions(
+        url=payload["url"],
+        framework=payload.get("framework", "cypress"),
+        language=payload.get("language", "javascript"),
+        mode=payload.get("mode", "black-box"),
+        test_focus=payload.get("test_focus") or ["smoke"],
+        source_paste=payload.get("source_paste"),
+        source_repo_url=payload.get("source_repo_url"),
+        extra_instructions=payload.get("extra_instructions"),
+    )
+
+    # If the caller already scanned, reuse it. Otherwise, scan now.
+    scan = payload.get("scan")
+    if not scan:
+        loop = asyncio.get_running_loop()
+        try:
+            scan = await loop.run_in_executor(None, test_writer.scan_page, opts.url)
+        except Exception as e:
+            raise HTTPException(502, f"scan failed: {type(e).__name__}: {e}")
+
+    # Generation can take 10s+ when Claude is in the loop — push to a worker
+    # thread so the event loop stays responsive.
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, test_writer.generate_tests, scan, opts,
+    )
+    result["scan_summary"] = scan.get("counts")
+    result["url"] = opts.url
+    return result
+
+
+@app.post("/api/ai/test-writer/save")
+async def ai_test_writer_save(
+    payload: dict,
+    user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    payload = payload or {}
+    framework = payload.get("framework", "cypress")
+    project = payload.get("project")
+    env = payload.get("env")
+    if not project:
+        raise HTTPException(400, "project is required")
+
+    # Multi-file path: caller sends {files: {relpath: content, ...}}
+    files = payload.get("files")
+    if files and isinstance(files, dict) and len(files) > 0:
+        try:
+            saved = test_writer.save_bundle(
+                files={str(k): str(v) for k, v in files.items()},
+                framework=framework, project=project, env=env,
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+        # Optional visual baseline — caller can pass a base64 PNG that
+        # was captured at scan time; we drop it next to the test files.
+        baseline = payload.get("baseline_b64")
+        if baseline:
+            wrote = test_writer.write_visual_baseline_to_bundle(
+                framework, project, env, baseline,
+            )
+            if wrote: saved["baseline_path"] = wrote
+
+        saved["saved_by"] = user["username"]
+        saved["saved_at"] = _now_iso()
+        return saved
+
+    # Legacy single-file path: {code, filename}
+    code = payload.get("code")
+    filename = payload.get("filename")
+    if not code or not filename:
+        raise HTTPException(400, "either `files` (dict) or `code`+`filename` is required")
+    saved = test_writer.save_spec(filename, code, framework, project=project, env=env)
+    saved["saved_by"] = user["username"]
+    saved["saved_at"] = _now_iso()
+    return saved
+
+
+@app.get("/api/ai/test-writer/projects")
+async def ai_test_writer_projects(
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    return test_writer.list_projects()
+
+
+# ---------------------------------------------------------------------------
+# AI infrastructure introspection (audit / cache / hooks)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/ai/audit")
+def ai_audit_log(
+    limit: int = 50,
+    event_type: str | None = None,
+    _user: dict = Depends(auth.require_roles(
+        "automation_engineer", "project_manager", "developer",
+    )),
+):
+    return {
+        "stats":  audit.stats(),
+        "items":  audit.list_recent(limit=min(limit, 200), event_type=event_type),
+    }
+
+
+@app.get("/api/ai/cache")
+def ai_cache_stats(
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    return llm_cache.stats()
+
+
+@app.delete("/api/ai/cache")
+def ai_cache_clear(
+    _user: dict = Depends(auth.require_roles("automation_engineer")),
+):
+    return {"cleared": llm_cache.clear()}
+
+
+@app.get("/api/ai/hooks")
+def ai_hooks_list(
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    return hooks.list_subscribers()
+
+
+@app.get("/api/ai/test-writer/frameworks")
+async def ai_test_writer_frameworks(
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    return frameworks.list_with_status()
+
+
+@app.post("/api/ai/test-writer/frameworks/{framework_id}/install")
+async def ai_test_writer_install(
+    framework_id: str,
+    _user: dict = Depends(auth.require_roles("automation_engineer")),
+):
+    try:
+        job = frameworks.start_install(framework_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {
+        "framework_id": framework_id,
+        "status": job.status,
+        "started_at": job.started_at,
+    }
+
+
+@app.get("/api/ai/test-writer/frameworks/{framework_id}/install-status")
+async def ai_test_writer_install_status(
+    framework_id: str,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    if not frameworks.by_id(framework_id):
+        raise HTTPException(404, f"unknown framework: {framework_id}")
+    return frameworks.install_log(framework_id, tail=80)
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +1336,11 @@ def _process_cypress_run(run_id: str, specs: list[str] | None, loop: asyncio.Abs
         run["finished_at"] = _now_iso()
     finally:
         emit_run()
+
+    # Auto-fix every newly created cypress bug, serially in this thread so
+    # parallel cypress runs don't fight for the same buggy-app server.
+    for uid in run.get("bug_uids", []):
+        _process_auto_fix(uid, loop)
 
 
 def _public_cypress(run: dict) -> dict:

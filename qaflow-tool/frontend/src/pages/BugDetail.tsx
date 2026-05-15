@@ -88,7 +88,9 @@ export default function BugDetail() {
     target === "cypress-tests" ? "automation_engineer" : "developer";
   const roleMatches = user?.role === requiredRole;
   const canDecide = bug.status === "FIX_READY" && roleMatches;
-  const canAutoFix = bug.status === "DETECTED" && bug.source === "cypress";
+  // Auto-fix runs automatically when cypress finishes. Manual retry is only
+  // useful if the bug got stuck — show the button only on FIX_FAILED.
+  const canAutoFix = bug.status === "FIX_FAILED" && bug.source === "cypress";
 
   return (
     <div className="space-y-6">
@@ -98,9 +100,25 @@ export default function BugDetail() {
           <h1 className="text-2xl font-semibold text-ink-100 mt-1">
             Bug #{bug.id} — {bug.title}
           </h1>
-          <div className="flex items-center gap-3 mt-2 text-xs">
+          <div className="flex items-center gap-3 mt-2 text-xs flex-wrap">
             <StatusBadge status={bug.status} />
-            <span className="text-ink-500 font-mono">branch: <span className="text-cyan-400">{bug.branch}</span></span>
+            {bug.branch && (
+              <span className="text-ink-500 font-mono">
+                branch:{" "}
+                {bug.fix?.target_repo === "buggy-app" ? (
+                  <a
+                    href={`https://github.com/Deniz3517/qaflow-buggy-app/tree/${bug.branch}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-cyan-400 hover:text-cyan-300 underline decoration-dotted"
+                  >
+                    {bug.branch} ↗
+                  </a>
+                ) : (
+                  <span className="text-cyan-400">{bug.branch}</span>
+                )}
+              </span>
+            )}
             {bug.fix && (
               <span className="text-ink-500 font-mono">
                 confidence: <span className="text-violet-300">{bug.fix.confidence}%</span>
@@ -212,8 +230,9 @@ export default function BugDetail() {
                 ? "bg-violet-500 hover:bg-violet-400 text-ink-950"
                 : "bg-ink-700/50 text-ink-500 cursor-not-allowed"
             }`}
+            title="Re-run auto-fix on this bug"
           >
-            {busy === "autofix" ? "Analyzing…" : "🤖 AUTO-FIX (AI)"}
+            {busy === "autofix" ? "Analyzing…" : "🔁 RETRY AUTO-FIX"}
           </button>
         )}
         <button

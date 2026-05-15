@@ -104,28 +104,34 @@ def analyze_and_fix(bug_id: int, source_file: Path) -> dict:
     return _mock_analyze(bug_id, source_file)
 
 
+_CYPRESS_FIX_MODEL = "claude-opus-4-7"
+
+
 def analyze_cypress_with_claude(
     bug_title: str,
     spec_file: Path,
     buggy_app_dir: Path,
     cypress_tests_dir: Path,
+    *,
+    bug_uid: str | None = None,
 ) -> dict:
     """Propose a fix for an arbitrary Cypress failure using Claude.
 
-    Used when cypress_fix_catalog has no matching entry. The model decides
-    whether the bug lives in the app (buggy-app) or in the test code
-    (cypress-tests) and produces a minimal patch.
-
-    Returns a dict in the shape consumed by _process_auto_fix:
-        {target_repo, file, old, new, analysis, confidence, title, type, severity, mode}
+    Pipeline:
+      1. Build the prompt from the versioned ``cypress_fix.v1`` template.
+      2. Hash (model + prompt) and consult the LLM cache — early-return on hit.
+      3. Otherwise call Claude, store the response, audit the call.
     """
     import json
+    import time
     import anthropic
+    import audit
+    import hooks
+    import llm_cache
+    import prompt_loader
 
     spec_text = spec_file.read_text() if spec_file.exists() else ""
 
-    # Bundle context: page objects + buggy-app source. Cap each file to keep
-    # the prompt sane.
     def _read(p: Path, max_chars: int = 8000) -> str:
         try:
             text = p.read_text()
@@ -152,52 +158,61 @@ def analyze_cypress_with_claude(
         for path, content in sources.items()
     )
 
-    prompt = f"""You are a senior QA engineer triaging a failing Cypress test.
-
-Failing test: {bug_title}
-
-Spec file (cypress-tests/cypress/e2e/{spec_file.name}):
-```
-{spec_text}
-```
-
-All potentially relevant project source files:
-{files_block}
-
-Decide whether the actual bug is in:
-- the application code (target_repo: "buggy-app"), OR
-- the test code, including page objects and selectors (target_repo: "cypress-tests").
-
-Return ONLY a single JSON object, with this exact shape:
-{{
-  "target_repo": "buggy-app" | "cypress-tests",
-  "file": "<relative path inside that repo>",
-  "analysis": "<2-4 sentences: where the bug is and why this patch fixes it>",
-  "old": "<verbatim substring currently in the file — must appear exactly once>",
-  "new": "<replacement substring>",
-  "confidence": <integer 0-100>
-}}
-
-Constraints:
-- "old" must appear verbatim (whitespace-exact) in the chosen file.
-- Make the SMALLEST possible change — no unrelated formatting churn.
-- Prefer fixing whichever side carries the logical error: if the app contradicts user expectations, fix the app; if the selector / chain is wrong, fix the test.
-- No prose outside the JSON object.
-"""
-
-    client = anthropic.Anthropic()
-    msg = client.messages.create(
-        model="claude-opus-4-7",
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
+    prompt = prompt_loader.load(
+        "cypress_fix", "v1",
+        bug_title=bug_title,
+        spec_file_name=spec_file.name,
+        spec_text=spec_text,
+        files_block=files_block,
     )
-    raw = msg.content[0].text.strip()
+
+    # ---- 1. cache lookup -----------------------------------------------
+    started = time.time()
+    cached = llm_cache.get(_CYPRESS_FIX_MODEL, prompt)
+    if cached is not None:
+        raw = cached
+        was_cache_hit = True
+    else:
+        client = anthropic.Anthropic()
+        msg = client.messages.create(
+            model=_CYPRESS_FIX_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        llm_cache.put(_CYPRESS_FIX_MODEL, prompt, raw)
+        was_cache_hit = False
+
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
             raw = raw[4:]
         raw = raw.strip()
-    data = json.loads(raw)
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        audit.record(
+            "cypress_fix", success=False,
+            bug_uid=bug_uid, engine="claude", cache_hit=was_cache_hit,
+            duration_ms=int((time.time() - started) * 1000),
+            error=f"json_parse: {e}",
+        )
+        raise
+
+    audit.record(
+        "cypress_fix", success=True,
+        bug_uid=bug_uid,
+        engine="cache-hit" if was_cache_hit else "claude",
+        cache_hit=was_cache_hit,
+        duration_ms=int((time.time() - started) * 1000),
+        summary=f"target={data.get('target_repo')} file={data.get('file')} confidence={data.get('confidence')}",
+    )
+    hooks.fire("on_ai_call", {
+        "event_type": "cypress_fix", "bug_uid": bug_uid,
+        "cache_hit": was_cache_hit,
+        "duration_ms": int((time.time() - started) * 1000),
+    })
 
     return {
         "mode": "claude",

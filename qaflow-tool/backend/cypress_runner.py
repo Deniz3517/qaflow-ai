@@ -94,6 +94,9 @@ def _parse_spec_output(log: str) -> dict:
         if m and not raw.lstrip().startswith("'"):
             # the first occurrence is the inline list, second is the detailed failure block
             name = m.group(1).strip()
+            # Filter out cypress' screenshot listing — those are paths, not test names.
+            if name.endswith(".png") or "screenshots/" in name or "(failed)" in name:
+                continue
             existing = next((t for t in tests if t["name"] == name and t["spec"] == current_spec), None)
             if not existing:
                 tests.append({

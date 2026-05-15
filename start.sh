@@ -24,6 +24,12 @@ cleanup() {
 trap cleanup INT TERM
 
 reset_buggy_app() {
+  # Off by default so live bug commits + AI fixes survive across reboots.
+  # Opt in for a clean demo: `QAFLOW_RESET_BUGGY_APP=1 ./start.sh`.
+  if [ "${QAFLOW_RESET_BUGGY_APP:-0}" != "1" ]; then
+    echo "[qaflow] keeping current buggy-app state (set QAFLOW_RESET_BUGGY_APP=1 to reset)"
+    return
+  fi
   echo "[qaflow] resetting buggy-app to seeded-bug state..."
   cd "$ROOT/buggy-app"
   git reset --hard "$(git rev-list --max-parents=0 HEAD)" -q

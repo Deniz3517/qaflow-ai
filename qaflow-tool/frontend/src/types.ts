@@ -123,6 +123,152 @@ export interface ManualBug {
   comments?: ManualBugComment[];
 }
 
+// ---------------------------------------------------------------------------
+// AI Test Cover Engine
+// ---------------------------------------------------------------------------
+
+export interface TestCoverScan {
+  url: string;
+  title: string;
+  counts: {
+    headings: number;
+    buttons: number;
+    links: number;
+    inputs: number;
+    forms: number;
+    images: number;
+    landmarks: number;
+  };
+  headings: { tag: string; text: string }[];
+  buttons: { id: string | null; text: string; type?: string | null }[];
+  links: { href: string; text: string }[];
+  inputs: { tag: string; id: string | null; type?: string | null; placeholder?: string | null }[];
+  forms: { id: string | null; method: string; input_ids: string[] }[];
+  landmarks: { landmark: string; id: string | null }[];
+}
+
+export type TestFramework = "cypress" | "playwright" | "selenium" | "robot";
+export type TestLanguage = "javascript" | "typescript" | "python";
+export type TestMode = "black-box" | "gray-box" | "white-box";
+
+export interface TestCoverGenerateRequest {
+  url: string;
+  framework: TestFramework;
+  language: TestLanguage;
+  mode: TestMode;
+  test_focus: string[];
+  source_paste?: string;
+  source_repo_url?: string;
+  extra_instructions?: string;
+  scan?: TestCoverScan;
+}
+
+export interface TestCoverGenerateResult {
+  files: Record<string, string>;
+  engine: "claude" | "mock";
+  framework: TestFramework;
+  language: TestLanguage;
+  fallback_reason?: string;
+  scan_summary?: TestCoverScan["counts"];
+  url: string;
+}
+
+export interface SavedBundle {
+  bundle_root: string;
+  bundle_relative: string;
+  framework: string;
+  framework_name: string;
+  project: string;
+  env: string | null;
+  files: { path: string; abs_path: string; size_bytes: number }[];
+  saved_by: string;
+  saved_at: string;
+  baseline_path?: string;
+}
+
+export interface CoverageEstimate {
+  items: { category: string; name: string; covered: boolean; note?: string }[];
+  total: number;
+  covered_estimate: number;
+  ratio: number;
+}
+
+export interface QualityScore {
+  score: number;
+  grade: "A" | "B" | "C" | "D" | "F";
+  tests_estimate: number;
+  files: number;
+  notes: { level: "ok" | "warn"; msg: string }[];
+}
+
+export interface RegenDiff {
+  exists: boolean;
+  bundle_root?: string;
+  items: {
+    path: string;
+    status: "added" | "removed" | "modified" | "unchanged";
+    old_bytes: number;
+    new_bytes: number;
+    diff: string;
+  }[];
+}
+
+export interface RunResult {
+  framework_id: string;
+  bundle: string;
+  cmd: string;
+  exit_code: number;
+  duration_s: number;
+  timed_out: boolean;
+  passed: number | null;
+  failed: number | null;
+  log_tail: string;
+}
+
+export interface AuthConfig {
+  kind: "form";
+  login_url: string;
+  username_field: string;
+  password_field: string;
+  submit: string;
+  credentials: { username: string; password: string };
+}
+
+export interface CrawlResult {
+  pages: TestCoverScan[];
+  count: number;
+}
+
+export interface TestCoverProject {
+  name: string;
+  slug: string;
+  spec_count: number;
+  direct_specs?: number;
+  envs: { slug: string; spec_count: number }[];
+}
+
+export interface TestFrameworkInfo {
+  id: string;
+  name: string;
+  language: TestLanguage;
+  extension: string;
+  workspace: string;
+  description: string;
+  installed: boolean;
+  version: string | null;
+  install_status: "pending" | "running" | "succeeded" | "failed" | null;
+  install_error: string | null;
+}
+
+export interface InstallStatus {
+  status: "not-started" | "pending" | "running" | "succeeded" | "failed";
+  started_at?: number;
+  finished_at?: number | null;
+  error?: string | null;
+  log: string[];
+  duration_s?: number;
+}
+
 export type CypressTestStatus = "pass" | "fail" | "pending";
 export interface CypressTest {
   spec: string | null;
