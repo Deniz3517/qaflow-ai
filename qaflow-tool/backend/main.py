@@ -1151,7 +1151,7 @@ async def ai_test_writer_discover(
         })
         raise HTTPException(502, f"input gather failed: {e}")
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") and os.getenv("QAFLOW_MOCK_MODE", "").strip() not in ("1","true","yes"):
         orchestrator.record_step_result(
             project_slug, "DISCOVERY",
             success=False, error="anthropic_api_key_missing",
@@ -1267,7 +1267,7 @@ async def ai_test_writer_smoke(
         or "http://localhost:3000"
     )
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") and os.getenv("QAFLOW_MOCK_MODE", "").strip() not in ("1","true","yes"):
         raise HTTPException(503, "ANTHROPIC_API_KEY required for smoke generation")
 
     orchestrator.mark_step_started(project_slug, "SMOKE_GEN")
@@ -1450,7 +1450,7 @@ async def ai_test_writer_e2e(
         or "http://localhost:3000"
     )
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") and os.getenv("QAFLOW_MOCK_MODE", "").strip() not in ("1","true","yes"):
         raise HTTPException(503, "ANTHROPIC_API_KEY required for e2e generation")
 
     orchestrator.mark_step_started(project_slug, "E2E_GEN")
@@ -1577,7 +1577,7 @@ async def ai_test_writer_negative(
         or "http://localhost:3000"
     )
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") and os.getenv("QAFLOW_MOCK_MODE", "").strip() not in ("1","true","yes"):
         raise HTTPException(503, "ANTHROPIC_API_KEY required for negative generation")
 
     orchestrator.mark_step_started(project_slug, "NEGATIVE_GEN")
@@ -1904,7 +1904,7 @@ async def ai_test_writer_api_discovery(
     if index is None:
         raise HTTPException(409, "no app_index found — run /discover first")
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") and os.getenv("QAFLOW_MOCK_MODE", "").strip() not in ("1","true","yes"):
         raise HTTPException(503, "ANTHROPIC_API_KEY required for api discovery")
 
     # Pull cumulative traffic dump if present (written by /smoke-run etc).
@@ -2019,7 +2019,7 @@ async def ai_test_writer_validate(
 
     base_url = (index.get("application") or {}).get("base_url") or ""
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") and os.getenv("QAFLOW_MOCK_MODE", "").strip() not in ("1","true","yes"):
         raise HTTPException(503, "ANTHROPIC_API_KEY required for validation")
 
     orchestrator.mark_step_started(project_slug, "VALIDATION")
@@ -2146,7 +2146,7 @@ async def ai_test_writer_extend(
 
     base_url = (index.get("application") or {}).get("base_url") or ""
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") and os.getenv("QAFLOW_MOCK_MODE", "").strip() not in ("1","true","yes"):
         raise HTTPException(503, "ANTHROPIC_API_KEY required for extend")
 
     orchestrator.mark_step_started(project_slug, "EXTEND")
@@ -2674,7 +2674,7 @@ async def ai_test_writer_orchestrate(
     if mode == "pdf" and not pdf_path:
         raise HTTPException(400, "pdf mode requires pdf_path")
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") and os.getenv("QAFLOW_MOCK_MODE", "").strip() not in ("1","true","yes"):
         raise HTTPException(503, "ANTHROPIC_API_KEY required for orchestration")
 
     framework_id = payload.get("framework") or "cypress-js"

@@ -114,6 +114,238 @@ _VALIDATION_MODEL = "claude-opus-4-7"
 _EXTEND_MODEL = "claude-opus-4-7"
 
 
+def _mock_mode_on() -> bool:
+    """When QAFLOW_MOCK_MODE=1, all v2 pipeline LLM calls return deterministic
+    fixtures so the orchestrator + bundle runner + state machine can be
+    exercised without hitting the Claude API (or burning tokens). Useful for:
+      - CI smoke tests of QAFLOW itself
+      - First-time setup validation before the user pastes a real API key
+      - Reproducing pipeline state issues without nondeterministic LLM output.
+    """
+    return os.getenv("QAFLOW_MOCK_MODE", "").strip() in ("1", "true", "yes")
+
+
+# ---------------------------------------------------------------------------
+# Mock fixtures — minimal but schema-valid outputs for each prompt
+# ---------------------------------------------------------------------------
+
+def _mock_app_index(project_slug: str, source_mode: str, target_url: str | None) -> dict:
+    base = target_url or "http://localhost:3000"
+    return {
+        "schema_version": "1.0",
+        "project_slug": project_slug,
+        "source": {"mode": source_mode, "url": target_url,
+                   "repo_url": None, "pdf_path": None},
+        "application": {
+            "name": project_slug,
+            "type": "auth_gated_saas_dashboard",
+            "detected_stack": {
+                "frontend": "Vanilla HTML + CSS (mock)",
+                "backend": None,
+                "auth_type": "form",
+            },
+            "base_url": base,
+            "environments": [],
+        },
+        "pages": [
+            {
+                "id": "login_page",
+                "path": "/login.html",
+                "purpose": "User signs in with email and password",
+                "importance": "critical",
+                "requires_auth": False,
+                "elements": {"forms": [{"id": "login-form"}],
+                             "buttons": [{"id": "login-button", "text": "Sign in"}],
+                             "inputs":  [{"id": "email", "type": "email"},
+                                         {"id": "password", "type": "password"}],
+                             "links": [], "headings": []},
+                "apis_called": [],
+                "error_states_seen": [],
+                "load_metrics": {"fcp_ms": None, "network_idle_ms": None},
+                "accessibility_notes": [],
+                "test_recommendations": ["smoke", "negative_validation"],
+                "discovered_subpages": [],
+            },
+        ],
+        "navigation": {"primary": [], "footer": []},
+        "auth_flow": {
+            "type": "form", "login_url": "/login.html",
+            "post_login_url": "/dashboard",
+            "username_field": "#email", "password_field": "#password",
+            "submit": "#login-button",
+            "session_cookie": None, "session_storage_key": None,
+            "logout_url": None, "blocker": None,
+        },
+        "test_users": [],
+        "discovered_apis": [],
+        "risk_flags": ["mock_mode_deterministic_fixture"],
+        "mobile_relevant": False,
+        "performance_budgets": {"page_load_p95_ms": 3000, "api_p95_ms": 500},
+        "next_step_recommendation": "smoke",
+        "blocker_reason": None,
+        "generation_history": [],
+    }
+
+
+def _mock_smoke_bundle(framework: str, project_slug: str) -> dict:
+    if framework in ("cypress", "cypress-js", "cypress-ts"):
+        files = {
+            "smoke/01_critical_path_login.smoke.cy.js":
+                "// QAFLOW_MOCK_MODE — placeholder smoke spec.\n"
+                "describe('@smoke mock', () => {\n"
+                "  it('placeholder — replace with real generation when ANTHROPIC_API_KEY is set', () => {\n"
+                "    expect(true).to.eq(true);\n"
+                "  });\n"
+                "});\n",
+            "README.md": f"# Mock smoke suite for {project_slug}\n\nGenerated under QAFLOW_MOCK_MODE.\n",
+        }
+    elif framework in ("playwright", "playwright-js"):
+        files = {
+            "smoke/01_critical_path_login.smoke.spec.js":
+                "import { test, expect } from '@playwright/test';\n\n"
+                "test('@smoke mock placeholder', async () => { expect(1).toBe(1); });\n",
+            "README.md": f"# Mock smoke suite for {project_slug}\n",
+        }
+    elif framework in ("robot", "robot-py"):
+        files = {
+            "smoke/01_critical_path_login.smoke.robot":
+                "*** Settings ***\nDocumentation    Mock smoke\n\n"
+                "*** Test Cases ***\nPlaceholder Mock Smoke\n    [Tags]    smoke\n"
+                "    Log    placeholder smoke under QAFLOW_MOCK_MODE\n",
+            "README.md": f"# Mock smoke suite for {project_slug}\n",
+        }
+    else:
+        files = {
+            "smoke/test_smoke_mock.py":
+                "def test_smoke_mock_placeholder():\n    assert True\n",
+            "README.md": f"# Mock smoke suite for {project_slug}\n",
+        }
+    return {
+        "files": files,
+        "summary": f"QAFLOW_MOCK_MODE — placeholder smoke bundle for {framework}",
+        "specs_generated": 1,
+        "expected_pass_rate_pct": 100,
+        "fragility_notes": ["mock fixture — not a real generation"],
+        "deferred_to_e2e": [],
+    }
+
+
+def _mock_e2e_bundle(framework: str, project_slug: str) -> dict:
+    files = {
+        "e2e/auth/01_login_journey.e2e.cy.js"
+        if framework.startswith("cypress")
+        else "e2e/auth/01_login_journey.e2e.spec.js":
+            "// QAFLOW_MOCK_MODE — placeholder e2e journey.\n",
+    }
+    return {
+        "files": files,
+        "summary": f"QAFLOW_MOCK_MODE — placeholder e2e for {framework}",
+        "specs_generated": 1,
+        "journeys_covered": [{"id": "mock_login", "area": "auth", "user_role": "admin",
+                              "page_transitions": 2, "mutation_endpoints": []}],
+        "skipped_journeys": [],
+        "expected_pass_rate_pct": 100,
+        "fragility_notes": [],
+        "follow_up_for_negative_step": [],
+    }
+
+
+def _mock_negative_bundle(framework: str, project_slug: str) -> dict:
+    return {
+        "files": {
+            "negative/auth/01_login_boundary.neg.cy.js"
+            if framework.startswith("cypress")
+            else "negative/auth/01_login_boundary.neg.spec.js":
+                "// QAFLOW_MOCK_MODE — placeholder boundary spec.\n",
+        },
+        "summary": "QAFLOW_MOCK_MODE — placeholder negative coverage",
+        "specs_generated": 1,
+        "coverage_matrix": {
+            "input_boundary": ["login_form"], "authn_authz": ["wrong_password"],
+            "network_failure": [], "concurrency": [], "browser_quirks": [],
+        },
+        "not_applicable": [],
+        "expected_pass_rate_pct": 100,
+        "fragility_notes": [],
+    }
+
+
+def _mock_openapi() -> dict:
+    yaml = (
+        "openapi: 3.1.0\n"
+        "info:\n"
+        "  title: QAFLOW_MOCK_MODE\n"
+        "  version: 0.0.0-mock\n"
+        "  description: |\n"
+        "    Placeholder OpenAPI synthesized in mock mode. Re-run with\n"
+        "    ANTHROPIC_API_KEY set to produce a real contract.\n"
+        "paths: {}\n"
+    )
+    return {
+        "openapi_yaml": yaml,
+        "operations_count": 0,
+        "tag_counts": {},
+        "auth_schemes_detected": [],
+        "coverage_warnings": ["mock_mode_no_real_traffic_synthesized"],
+        "redactions_count": 0,
+    }
+
+
+def _mock_validation(project_slug: str) -> dict:
+    md = (
+        f"# Test Suite Architecture — {project_slug}\n\n"
+        "## 1. Executive summary\n\n"
+        "- **Verdict:** YELLOW — generated under QAFLOW_MOCK_MODE; "
+        "no real LLM calls were made.\n"
+        "- **Totals:** placeholder counts only.\n"
+        "- **Top 3 risks:** none surfaced (mock).\n"
+        "- **Coverage gaps:** every page (mock fixtures are placeholders).\n"
+        "- **Recommended next QA investment:** unset QAFLOW_MOCK_MODE and "
+        "re-run with ANTHROPIC_API_KEY.\n\n"
+        "## 2. Suite topology\n\n"
+        "(placeholder)\n\n"
+        "## 3. Coverage matrix\n\n"
+        "| Page | Importance | Smoke | E2E | Negative | API contract | Notes |\n"
+        "|---|---|---|---|---|---|---|\n"
+        "| login_page | critical | ✓ | ✓ | ✓ | — | mock |\n"
+    )
+    return {
+        "report_md": md, "verdict": "YELLOW",
+        "verdict_reason": "QAFLOW_MOCK_MODE active — placeholder fixtures",
+        "totals": {
+            "smoke":    {"passed": 1, "failed": 0, "pass_rate_pct": 100},
+            "e2e":      {"passed": 1, "failed": 0, "pass_rate_pct": 100},
+            "negative": {"passed": 1, "failed": 0, "pass_rate_pct": 100},
+        },
+        "top_risks": ["mock_mode_active"],
+        "expansion_plan_summary": [],
+    }
+
+
+def _mock_extend(project_slug: str, gaps: list[str]) -> dict:
+    return {
+        "new_files": {
+            f"e2e/extend/01_mock_extend_{i}.e2e.cy.js":
+                f"// QAFLOW_MOCK_MODE — placeholder extension for gap: {g}\n"
+            for i, g in enumerate(gaps, 1)
+        },
+        "modified_files": {},
+        "app_index_patch": {
+            "pages_added": [], "apis_added": [], "risk_flags_added": [],
+            "history_appended": [{
+                "step": "extend",
+                "summary": f"mock extend covering {len(gaps)} gap(s)",
+                "files_added": len(gaps), "files_modified": 0,
+            }],
+        },
+        "spurious_gaps": [],
+        "coverage_documented_skip": [],
+        "regression_checklist_additions": [],
+        "fragility_notes": ["mock fixture"],
+        "summary": "QAFLOW_MOCK_MODE — placeholder extend",
+    }
+
+
 def _strip_json_fences(raw: str) -> str:
     """Tolerate AI responses wrapped in ```json fences or with leading prose."""
     s = raw.strip()
@@ -149,6 +381,9 @@ def run_discovery(
     Caller is responsible for persisting the returned index via app_index.save().
     Raises on JSON parse error so the orchestrator can mark DISCOVERY blocked.
     """
+    if _mock_mode_on():
+        return _mock_app_index(project_slug, source_mode, target_url)
+
     import json as _json
     import time
     import anthropic
@@ -246,6 +481,9 @@ def run_smoke_generation(
     Returns: {files: {path: contents}, summary, specs_generated,
               expected_pass_rate_pct, fragility_notes, deferred_to_e2e}
     """
+    if _mock_mode_on():
+        return _mock_smoke_bundle(framework, project_slug)
+
     import json as _json
     import time
     import anthropic
@@ -518,6 +756,9 @@ def run_e2e_generation(
     existing_artifacts: list[str] | None = None,
 ) -> dict:
     """STEP 3 — produce the E2E journey suite via the e2e.v1 prompt."""
+    if _mock_mode_on():
+        return _mock_e2e_bundle(framework, project_slug)
+
     import json as _json
     import prompt_loader
 
@@ -551,6 +792,9 @@ def run_negative_generation(
     discovered_apis: list[dict],
 ) -> dict:
     """STEP 4 — produce the negative + edge-case suite via the negative.v1 prompt."""
+    if _mock_mode_on():
+        return _mock_negative_bundle(framework, project_slug)
+
     import json as _json
     import prompt_loader
 
@@ -584,6 +828,9 @@ def run_api_discovery(
     Returns {openapi_yaml, operations_count, tag_counts, auth_schemes_detected,
              coverage_warnings, redactions_count}.
     """
+    if _mock_mode_on():
+        return _mock_openapi()
+
     import json as _json
     import prompt_loader
 
@@ -615,6 +862,9 @@ def run_validation(
     risk_flags: list[str],
 ) -> dict:
     """STEP 6 — final handover doc + GREEN/YELLOW/RED verdict."""
+    if _mock_mode_on():
+        return _mock_validation(project_slug)
+
     import json as _json
     import prompt_loader
 
@@ -650,6 +900,9 @@ def run_extend(
 ) -> dict:
     """Incremental extension — accepts user-reported gaps + delta scan,
     returns new_files / modified_files / app_index_patch."""
+    if _mock_mode_on():
+        return _mock_extend(project_slug, gaps or [])
+
     import json as _json
     import prompt_loader
 

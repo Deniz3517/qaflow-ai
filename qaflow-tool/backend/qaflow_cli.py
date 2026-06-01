@@ -84,8 +84,10 @@ def _die(msg: str, code: int = 1) -> None:
 
 
 def _require_key() -> None:
+    if os.environ.get("QAFLOW_MOCK_MODE", "").strip() in ("1", "true", "yes"):
+        return    # mock mode satisfies the key requirement with fixtures
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        _die("ANTHROPIC_API_KEY is not set", code=3)
+        _die("ANTHROPIC_API_KEY is not set (or set QAFLOW_MOCK_MODE=1 for dry-run)", code=3)
 
 
 def _slug(p: str) -> str:
@@ -141,8 +143,14 @@ def cmd_discover(args) -> int:
     git_index_text: str | None = None
     pdf_excerpt_text: str | None = None
 
-    print(f"[discover] mode={args.mode} project={slug}", file=sys.stderr)
-    if args.mode == "product":
+    mock_active = os.environ.get("QAFLOW_MOCK_MODE", "").strip() in ("1", "true", "yes")
+
+    print(f"[discover] mode={args.mode} project={slug}"
+          + (" (MOCK)" if mock_active else ""), file=sys.stderr)
+    if mock_active:
+        print("[discover] mock mode — skipping real scan/crawl/clone, "
+              "ai_engine will return a fixture APP_INDEX", file=sys.stderr)
+    elif args.mode == "product":
         print(f"[discover] scanning {args.url} (with network capture)…", file=sys.stderr)
         scan = test_writer.scan_page(args.url, None, False, True)
         if args.max_pages > 1:
