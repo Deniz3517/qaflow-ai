@@ -30,6 +30,7 @@ Routes:
 import asyncio
 import difflib
 import json
+import os
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -1036,6 +1037,2039 @@ async def ai_test_writer_projects(
     _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
 ):
     return test_writer.list_projects()
+
+
+# ---------------------------------------------------------------------------
+# Multi-step pipeline (QAFLOW v2): discovery → smoke → e2e → negative → ...
+# Each endpoint is one step; orchestrator.py persists state between calls.
+# ---------------------------------------------------------------------------
+
+import app_index            # noqa: E402  (intentional late import — keeps module surface small)
+import orchestrator         # noqa: E402
+import source_extractors    # noqa: E402
+import fakemail             # noqa: E402
+import perf_runner          # noqa: E402
+
+
+@app.post("/api/ai/test-writer/discover")
+async def ai_test_writer_discover(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """STEP 1 — analyze the target and produce APP_INDEX.
+
+    Body:
+      {
+        "project":         "<required slug>",
+        "mode":            "product" | "git" | "pdf",
+        "url":             "<for product mode>",
+        "repo_url":        "<for git mode>",
+        "pdf_path":        "<for pdf mode>",
+        "auth":            { ... }      # optional login config (same shape as /scan)
+        "test_users":      [ ... ]      # optional pre-provisioned accounts
+        "max_pages":       8,           # crawl budget
+        "extra_instructions": "..."     # passed through if needed
+      }
+
+    Returns the APP_INDEX JSON and persists it to
+    tests/{project}/.qaflow/app_index.json.
+    """
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    project_slug = app_index.project_slug_from(project)
+
+    mode = (payload.get("mode") or "product").strip()
+    if mode not in ("product", "git", "pdf"):
+        raise HTTPException(400, "mode must be one of: product, git, pdf")
+
+    url = (payload.get("url") or "").strip() or None
+    repo_url = (payload.get("repo_url") or "").strip() or None
+    pdf_path = (payload.get("pdf_path") or "").strip() or None
+
+    if mode == "product" and not (url and url.startswith(("http://", "https://"))):
+        raise HTTPException(400, "product mode requires a url (http:// or https://)")
+    if mode == "git" and not repo_url:
+        raise HTTPException(400, "git mode requires repo_url")
+    if mode == "pdf" and not pdf_path:
+        raise HTTPException(400, "pdf mode requires pdf_path")
+
+    max_pages = int(payload.get("max_pages") or 8)
+    auth_cfg = payload.get("auth")
+    test_users = payload.get("test_users") or []
+
+    orchestrator.mark_step_started(project_slug, "DISCOVERY")
+    await _broadcast({
+        "type": "pipeline.step_started",
+        "project": project_slug,
+        "step": "DISCOVERY",
+    })
+
+    # ------------------------------------------------------------------
+    # Gather inputs by mode. For now, product mode is fully wired;
+    # git/pdf gather a stub block — to be expanded in Week 3.
+    # ------------------------------------------------------------------
+    scan: dict = {}
+    crawl_pages_list: list[dict] = []
+    git_index_text: str | None = None
+    pdf_excerpt_text: str | None = None
+
+    loop = asyncio.get_running_loop()
+    try:
+        if mode == "product":
+            scan = await loop.run_in_executor(
+                None,
+                lambda: test_writer.scan_page(
+                    url, auth_cfg, False, True,   # capture_network=True
+                ),
+            )
+            crawl_pages_list = await loop.run_in_executor(
+                None,
+                lambda: test_writer.crawl_pages(
+                    url, max_pages, True, auth_cfg, True,
+                ),
+            )
+        elif mode == "git":
+            git_index_text = await loop.run_in_executor(
+                None,
+                lambda: source_extractors.extract_git_index(repo_url),
+            )
+        elif mode == "pdf":
+            pdf_excerpt_text = await loop.run_in_executor(
+                None,
+                lambda: source_extractors.extract_pdf(pdf_path),
+            )
+    except Exception as e:
+        orchestrator.record_step_result(
+            project_slug, "DISCOVERY",
+            success=False, error=f"input_gather_failed: {type(e).__name__}: {e}",
+        )
+        await _broadcast({
+            "type": "pipeline.step_failed", "project": project_slug,
+            "step": "DISCOVERY", "error": str(e),
+        })
+        raise HTTPException(502, f"input gather failed: {e}")
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        orchestrator.record_step_result(
+            project_slug, "DISCOVERY",
+            success=False, error="anthropic_api_key_missing",
+        )
+        raise HTTPException(503, "ANTHROPIC_API_KEY required for discovery step")
+
+    try:
+        index = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_discovery(
+                project_slug=project_slug,
+                source_mode=mode,
+                target_url=url,
+                scan=scan,
+                crawl_pages_list=crawl_pages_list,
+                auth_config=auth_cfg,
+                test_users=test_users,
+                git_index=git_index_text,
+                pdf_excerpt=pdf_excerpt_text,
+                crawl_max_pages=max_pages,
+            ),
+        )
+    except Exception as e:
+        orchestrator.record_step_result(
+            project_slug, "DISCOVERY",
+            success=False, error=f"llm_failed: {type(e).__name__}: {e}",
+        )
+        await _broadcast({
+            "type": "pipeline.step_failed", "project": project_slug,
+            "step": "DISCOVERY", "error": str(e),
+        })
+        raise HTTPException(502, f"discovery failed: {e}")
+
+    # Persist + advance state.
+    index["project_slug"] = project_slug
+    app_index.save(project_slug, index)
+
+    # Seed the traffic dump with what we observed during scan + crawl.
+    # api-discovery will read this later to enrich the OpenAPI synthesis.
+    seed_traffic: list[dict] = list(scan.get("network_requests") or [])
+    for page in (crawl_pages_list or []):
+        seed_traffic.extend(page.get("network_requests") or [])
+    traffic_written = app_index.append_traffic(project_slug, seed_traffic)
+
+    state = orchestrator.record_step_result(
+        project_slug, "DISCOVERY",
+        success=True,
+        summary=f"pages={len(index.get('pages') or [])}",
+        files_generated=None,
+        artifacts={
+            "app_index_path": str(app_index.index_path(project_slug)),
+            "pages_count": len(index.get("pages") or []),
+            "apis_count": len(index.get("discovered_apis") or []),
+            "traffic_records_seeded": traffic_written,
+        },
+    )
+
+    await _broadcast({
+        "type": "pipeline.step_completed",
+        "project": project_slug,
+        "step": "DISCOVERY",
+        "state": state.current_state,
+        "blocked_reason": state.blocked_reason,
+    })
+
+    return {
+        "project": project_slug,
+        "app_index": index,
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+    }
+
+
+@app.post("/api/ai/test-writer/smoke")
+async def ai_test_writer_smoke(
+    payload: dict,
+    user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """STEP 2 — generate the smoke test suite from APP_INDEX.
+
+    Body:
+      {
+        "project":   "<required slug — must already have an app_index.json>",
+        "framework": "cypress-js" | "playwright-js" | "robot-py" | ...
+        "env":       "<optional sub-folder under {project}-{framework}>"
+      }
+    """
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    project_slug = app_index.project_slug_from(project)
+
+    index = app_index.load(project_slug)
+    if index is None:
+        raise HTTPException(409, "no app_index found — run /discover first")
+
+    framework_id = payload.get("framework") or "cypress-js"
+    spec = frameworks.by_id(framework_id)
+    if not spec:
+        raise HTTPException(400, f"unknown framework: {framework_id}")
+
+    engine_for_prompt = {
+        "cypress-js": "cypress", "cypress-ts": "cypress",
+        "playwright-js": "playwright",
+        "pytest-playwright": "pytest-playwright",
+        "robot-py": "robot",
+        "selenium-py": "selenium",
+    }.get(framework_id, "cypress")
+
+    base_url = (
+        (index.get("application") or {}).get("base_url")
+        or (index.get("source") or {}).get("url")
+        or "http://localhost:3000"
+    )
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(503, "ANTHROPIC_API_KEY required for smoke generation")
+
+    orchestrator.mark_step_started(project_slug, "SMOKE_GEN")
+    await _broadcast({
+        "type": "pipeline.step_started",
+        "project": project_slug, "step": "SMOKE_GEN",
+    })
+
+    slice_ = app_index.slice_for_prompt(index, "smoke_gen")
+
+    loop = asyncio.get_running_loop()
+    try:
+        data = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_smoke_generation(
+                project_slug=project_slug,
+                framework=engine_for_prompt,
+                language=spec.language,
+                framework_folder=spec.folder_name,
+                base_url=base_url,
+                app_index_slice=slice_,
+            ),
+        )
+    except Exception as e:
+        orchestrator.record_step_result(
+            project_slug, "SMOKE_GEN",
+            success=False, error=f"llm_failed: {type(e).__name__}: {e}",
+        )
+        await _broadcast({
+            "type": "pipeline.step_failed", "project": project_slug,
+            "step": "SMOKE_GEN", "error": str(e),
+        })
+        raise HTTPException(502, f"smoke generation failed: {e}")
+
+    files = data.get("files") or {}
+    if not files:
+        orchestrator.record_step_result(
+            project_slug, "SMOKE_GEN",
+            success=False, error="no_files_returned",
+        )
+        raise HTTPException(502, "smoke generation returned no files")
+
+    env = (payload.get("env") or "").strip() or None
+    try:
+        saved = test_writer.save_bundle(
+            files={str(k): str(v) for k, v in files.items()},
+            framework=framework_id,
+            project=project_slug,
+            env=env,
+        )
+    except ValueError as e:
+        orchestrator.record_step_result(
+            project_slug, "SMOKE_GEN",
+            success=False, error=f"save_failed: {e}",
+        )
+        raise HTTPException(400, str(e))
+
+    state = orchestrator.record_step_result(
+        project_slug, "SMOKE_GEN",
+        success=True,
+        summary=data.get("summary") or "",
+        files_generated=len(files),
+        artifacts={
+            "bundle_root": saved.get("bundle_root"),
+            "framework": framework_id,
+            "expected_pass_rate_pct": data.get("expected_pass_rate_pct"),
+            "fragility_notes": data.get("fragility_notes") or [],
+        },
+    )
+
+    await _broadcast({
+        "type": "pipeline.step_completed",
+        "project": project_slug,
+        "step": "SMOKE_GEN",
+        "state": state.current_state,
+        "files_count": len(files),
+    })
+
+    return {
+        "project": project_slug,
+        "framework": framework_id,
+        "saved": saved,
+        "summary": data.get("summary"),
+        "expected_pass_rate_pct": data.get("expected_pass_rate_pct"),
+        "fragility_notes": data.get("fragility_notes") or [],
+        "deferred_to_e2e": data.get("deferred_to_e2e") or [],
+        "files": list(files.keys()),
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+    }
+
+
+def _bundle_root(project_slug: str, framework_id: str, env: str | None = None) -> Path:
+    """Resolve the bundle root path for a project+framework (read-only helper)."""
+    spec = frameworks.by_id(framework_id)
+    if not spec:
+        raise ValueError(f"unknown framework: {framework_id}")
+    root = frameworks.QAFLOW_ROOT / "tests" / project_slug / f"{project_slug}-{spec.folder_name}"
+    if env:
+        root = root / env
+    return root
+
+
+def _list_relpaths(root: Path, subdir: str | None = None) -> list[str]:
+    """Walk root[/subdir] and return relative paths (sorted) — used to feed
+    'existing artifacts' / 'existing spec filenames' into prompts so the AI
+    knows what NOT to duplicate."""
+    base = root / subdir if subdir else root
+    if not base.exists():
+        return []
+    out: list[str] = []
+    for p in sorted(base.rglob("*")):
+        if p.is_file() and not p.name.startswith("."):
+            out.append(str(p.relative_to(root)))
+    return out
+
+
+def _last_smoke_run(project_slug: str) -> dict | None:
+    """Find the most recent SMOKE_RUN entry in orchestrator history."""
+    snap = orchestrator.progress_snapshot(project_slug)
+    for h in reversed(snap.get("history") or []):
+        if h.get("step") == "SMOKE_RUN" and h.get("success"):
+            return h
+    return None
+
+
+@app.post("/api/ai/test-writer/e2e")
+async def ai_test_writer_e2e(
+    payload: dict,
+    user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """STEP 3 — generate the E2E journey suite from APP_INDEX.
+
+    Pre-conditions:
+      - APP_INDEX exists on disk (run /discover)
+      - SMOKE_RUN passed the gate (orchestrator advanced past SMOKE_GATE).
+        If smoke hasn't been run yet, this endpoint accepts a `force=true`
+        flag to skip the gate (for development convenience).
+    """
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    project_slug = app_index.project_slug_from(project)
+
+    index = app_index.load(project_slug)
+    if index is None:
+        raise HTTPException(409, "no app_index found — run /discover first")
+
+    framework_id = payload.get("framework") or "cypress-js"
+    spec = frameworks.by_id(framework_id)
+    if not spec:
+        raise HTTPException(400, f"unknown framework: {framework_id}")
+
+    snap = orchestrator.progress_snapshot(project_slug)
+    if snap["current_state"] in ("INIT", "DISCOVERY", "SMOKE_GEN") and not payload.get("force"):
+        raise HTTPException(
+            409,
+            f"orchestrator is at {snap['current_state']} — smoke must complete first "
+            f"(or pass force=true to override)",
+        )
+
+    smoke_meta = _last_smoke_run(project_slug) or {}
+    smoke_pass_rate = int(smoke_meta.get("pass_rate_pct") or 100)
+    smoke_duration_s = float((smoke_meta.get("finished_at") or 0) - (smoke_meta.get("started_at") or 0))
+    smoke_spec_count = int((smoke_meta.get("artifacts") or {}).get("specs_executed") or 0)
+
+    env = (payload.get("env") or "").strip() or None
+    bundle_root = _bundle_root(project_slug, framework_id, env)
+    existing_artifacts = _list_relpaths(bundle_root)
+
+    engine_for_prompt = {
+        "cypress-js": "cypress", "cypress-ts": "cypress",
+        "playwright-js": "playwright",
+        "pytest-playwright": "pytest-playwright",
+        "robot-py": "robot", "selenium-py": "selenium",
+    }.get(framework_id, "cypress")
+    base_url = (
+        (index.get("application") or {}).get("base_url")
+        or (index.get("source") or {}).get("url")
+        or "http://localhost:3000"
+    )
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(503, "ANTHROPIC_API_KEY required for e2e generation")
+
+    orchestrator.mark_step_started(project_slug, "E2E_GEN")
+    await _broadcast({"type": "pipeline.step_started", "project": project_slug, "step": "E2E_GEN"})
+
+    slice_ = app_index.slice_for_prompt(index, "e2e_gen")
+    loop = asyncio.get_running_loop()
+    try:
+        data = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_e2e_generation(
+                project_slug=project_slug,
+                framework=engine_for_prompt, language=spec.language,
+                framework_folder=spec.folder_name, base_url=base_url,
+                app_index_json=slice_,
+                smoke_pass_rate=smoke_pass_rate,
+                smoke_duration_s=smoke_duration_s,
+                smoke_spec_count=smoke_spec_count,
+                existing_artifacts=existing_artifacts,
+            ),
+        )
+    except Exception as e:
+        orchestrator.record_step_result(project_slug, "E2E_GEN",
+            success=False, error=f"llm_failed: {type(e).__name__}: {e}")
+        await _broadcast({"type": "pipeline.step_failed", "project": project_slug,
+                          "step": "E2E_GEN", "error": str(e)})
+        raise HTTPException(502, f"e2e generation failed: {e}")
+
+    files = data.get("files") or {}
+    if not files:
+        orchestrator.record_step_result(project_slug, "E2E_GEN",
+            success=False, error="no_files_returned")
+        raise HTTPException(502, "e2e generation returned no files")
+
+    try:
+        saved = test_writer.save_bundle(
+            files={str(k): str(v) for k, v in files.items()},
+            framework=framework_id, project=project_slug, env=env,
+        )
+    except ValueError as e:
+        orchestrator.record_step_result(project_slug, "E2E_GEN",
+            success=False, error=f"save_failed: {e}")
+        raise HTTPException(400, str(e))
+
+    state = orchestrator.record_step_result(
+        project_slug, "E2E_GEN", success=True,
+        summary=data.get("summary") or "",
+        files_generated=len(files),
+        artifacts={
+            "bundle_root": saved.get("bundle_root"),
+            "framework": framework_id,
+            "expected_pass_rate_pct": data.get("expected_pass_rate_pct"),
+            "journeys_covered": data.get("journeys_covered") or [],
+            "skipped_journeys": data.get("skipped_journeys") or [],
+        },
+    )
+    await _broadcast({"type": "pipeline.step_completed", "project": project_slug,
+                      "step": "E2E_GEN", "state": state.current_state,
+                      "files_count": len(files)})
+
+    return {
+        "project": project_slug, "framework": framework_id,
+        "saved": saved,
+        "summary": data.get("summary"),
+        "journeys_covered": data.get("journeys_covered") or [],
+        "skipped_journeys": data.get("skipped_journeys") or [],
+        "expected_pass_rate_pct": data.get("expected_pass_rate_pct"),
+        "fragility_notes": data.get("fragility_notes") or [],
+        "files": list(files.keys()),
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+    }
+
+
+@app.post("/api/ai/test-writer/negative")
+async def ai_test_writer_negative(
+    payload: dict,
+    user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """STEP 4 — generate the negative/edge-case suite from APP_INDEX.
+
+    Pre-conditions: APP_INDEX present. Soft-checked: E2E_GEN completed
+    (so it can read existing e2e specs); pass force=true to override.
+    """
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    project_slug = app_index.project_slug_from(project)
+
+    index = app_index.load(project_slug)
+    if index is None:
+        raise HTTPException(409, "no app_index found — run /discover first")
+
+    framework_id = payload.get("framework") or "cypress-js"
+    spec = frameworks.by_id(framework_id)
+    if not spec:
+        raise HTTPException(400, f"unknown framework: {framework_id}")
+
+    snap = orchestrator.progress_snapshot(project_slug)
+    upstream_done = snap["current_state"] in (
+        "NEGATIVE_GEN", "NEGATIVE_RUN", "API_DISCOVERY", "VALIDATION", "DONE",
+    )
+    if not upstream_done and not payload.get("force"):
+        raise HTTPException(
+            409,
+            f"orchestrator is at {snap['current_state']} — e2e must complete first "
+            f"(or pass force=true to override)",
+        )
+
+    env = (payload.get("env") or "").strip() or None
+    bundle_root = _bundle_root(project_slug, framework_id, env)
+    smoke_filenames = _list_relpaths(bundle_root, "smoke")
+    e2e_filenames = _list_relpaths(bundle_root, "e2e")
+
+    engine_for_prompt = {
+        "cypress-js": "cypress", "cypress-ts": "cypress",
+        "playwright-js": "playwright",
+        "pytest-playwright": "pytest-playwright",
+        "robot-py": "robot", "selenium-py": "selenium",
+    }.get(framework_id, "cypress")
+    base_url = (
+        (index.get("application") or {}).get("base_url")
+        or (index.get("source") or {}).get("url")
+        or "http://localhost:3000"
+    )
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(503, "ANTHROPIC_API_KEY required for negative generation")
+
+    orchestrator.mark_step_started(project_slug, "NEGATIVE_GEN")
+    await _broadcast({"type": "pipeline.step_started", "project": project_slug,
+                      "step": "NEGATIVE_GEN"})
+
+    slice_ = app_index.slice_for_prompt(index, "negative_gen")
+    loop = asyncio.get_running_loop()
+    try:
+        data = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_negative_generation(
+                project_slug=project_slug,
+                framework=engine_for_prompt, language=spec.language,
+                framework_folder=spec.folder_name, base_url=base_url,
+                app_index_json=slice_,
+                smoke_filenames=smoke_filenames,
+                e2e_filenames=e2e_filenames,
+                discovered_apis=index.get("discovered_apis") or [],
+            ),
+        )
+    except Exception as e:
+        orchestrator.record_step_result(project_slug, "NEGATIVE_GEN",
+            success=False, error=f"llm_failed: {type(e).__name__}: {e}")
+        await _broadcast({"type": "pipeline.step_failed", "project": project_slug,
+                          "step": "NEGATIVE_GEN", "error": str(e)})
+        raise HTTPException(502, f"negative generation failed: {e}")
+
+    files = data.get("files") or {}
+    if not files:
+        orchestrator.record_step_result(project_slug, "NEGATIVE_GEN",
+            success=False, error="no_files_returned")
+        raise HTTPException(502, "negative generation returned no files")
+
+    try:
+        saved = test_writer.save_bundle(
+            files={str(k): str(v) for k, v in files.items()},
+            framework=framework_id, project=project_slug, env=env,
+        )
+    except ValueError as e:
+        orchestrator.record_step_result(project_slug, "NEGATIVE_GEN",
+            success=False, error=f"save_failed: {e}")
+        raise HTTPException(400, str(e))
+
+    state = orchestrator.record_step_result(
+        project_slug, "NEGATIVE_GEN", success=True,
+        summary=data.get("summary") or "",
+        files_generated=len(files),
+        artifacts={
+            "bundle_root": saved.get("bundle_root"),
+            "framework": framework_id,
+            "coverage_matrix": data.get("coverage_matrix") or {},
+            "not_applicable": data.get("not_applicable") or [],
+            "expected_pass_rate_pct": data.get("expected_pass_rate_pct"),
+        },
+    )
+    await _broadcast({"type": "pipeline.step_completed", "project": project_slug,
+                      "step": "NEGATIVE_GEN", "state": state.current_state,
+                      "files_count": len(files)})
+
+    return {
+        "project": project_slug, "framework": framework_id,
+        "saved": saved,
+        "summary": data.get("summary"),
+        "coverage_matrix": data.get("coverage_matrix") or {},
+        "not_applicable": data.get("not_applicable") or [],
+        "expected_pass_rate_pct": data.get("expected_pass_rate_pct"),
+        "fragility_notes": data.get("fragility_notes") or [],
+        "files": list(files.keys()),
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+    }
+
+
+import bundle_runner  # noqa: E402
+
+
+async def _run_bundle_step(
+    project_slug: str,
+    framework_id: str,
+    step: str,                   # "smoke" | "e2e" | "negative"
+    env: str | None,
+    orchestrator_step: str,      # "SMOKE_RUN" | "E2E_RUN" | "NEGATIVE_RUN"
+    require_gate: bool,          # whether pass_rate determines BLOCKED vs forward
+) -> dict:
+    """Shared dispatch for the three *_run endpoints.
+
+    Executes the framework's runner against {bundle}/{step}/, captures
+    pass_rate_pct, and reports back to the orchestrator. For SMOKE_RUN and
+    E2E_RUN the gate triggers a BLOCKED state if pass rate is below threshold.
+    """
+    bundle_root = _bundle_root(project_slug, framework_id, env)
+
+    orchestrator.mark_step_started(project_slug, orchestrator_step)
+    await _broadcast({"type": "pipeline.step_started",
+                      "project": project_slug, "step": orchestrator_step})
+
+    loop = asyncio.get_running_loop()
+
+    def _on_line(line: str) -> None:
+        # Fire-and-forget WS broadcast; coroutine-safe via the captured loop.
+        asyncio.run_coroutine_threadsafe(
+            _broadcast({"type": "pipeline.run_log",
+                        "project": project_slug, "step": orchestrator_step,
+                        "line": line[:500]}),
+            loop,
+        )
+
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: bundle_runner.run(bundle_root, framework_id, step, _on_line),
+        )
+    except Exception as e:
+        orchestrator.record_step_result(
+            project_slug, orchestrator_step,
+            success=False, error=f"runner_failed: {type(e).__name__}: {e}",
+        )
+        await _broadcast({"type": "pipeline.step_failed",
+                          "project": project_slug, "step": orchestrator_step,
+                          "error": str(e)})
+        raise HTTPException(502, f"runner failed: {e}")
+
+    # Auto-install on first run — same shortcut as the orchestrate chain uses.
+    if result.get("install_required"):
+        await _broadcast({"type": "pipeline.run_log",
+                          "project": project_slug, "step": orchestrator_step,
+                          "line": "[auto-install] bundle deps missing — installing once and retrying"})
+        install_res = await loop.run_in_executor(
+            None,
+            lambda: bundle_runner.install_bundle_deps(bundle_root, framework_id),
+        )
+        if install_res.get("ok"):
+            await _broadcast({"type": "pipeline.run_log",
+                              "project": project_slug, "step": orchestrator_step,
+                              "line": "[auto-install] deps installed — re-running tests"})
+            result = await loop.run_in_executor(
+                None,
+                lambda: bundle_runner.run(bundle_root, framework_id, step, _on_line),
+            )
+        else:
+            # Install itself failed — record and bail.
+            orchestrator.record_step_result(
+                project_slug, orchestrator_step,
+                success=False, pass_rate_pct=0,
+                error=f"install_failed: {(install_res.get('log') or '')[-200:]}",
+                artifacts={"install_log_tail": (install_res.get("log") or "")[-2000:]},
+            )
+            await _broadcast({"type": "pipeline.step_failed",
+                              "project": project_slug, "step": orchestrator_step,
+                              "error": "install_failed"})
+            return {"project": project_slug, "framework": framework_id, **result,
+                    "install_failed": True,
+                    "install_log_tail": (install_res.get("log") or "")[-2000:],
+                    "orchestrator": orchestrator.progress_snapshot(project_slug)}
+
+    pass_rate = int(result.get("pass_rate_pct") or 0)
+    total = int(result.get("total") or 0)
+
+    # If the retry STILL says install_required, surface that as a clear failure.
+    if result.get("install_required"):
+        orchestrator.record_step_result(
+            project_slug, orchestrator_step,
+            success=False, pass_rate_pct=0,
+            error="install_required_after_retry",
+            artifacts={"runner_log": result.get("log_tail")},
+        )
+        await _broadcast({"type": "pipeline.step_failed",
+                          "project": project_slug, "step": orchestrator_step,
+                          "error": "install_required_after_retry"})
+        return {"project": project_slug, "framework": framework_id, **result,
+                "orchestrator": orchestrator.progress_snapshot(project_slug)}
+
+    if result.get("unsupported_framework"):
+        # Don't block the pipeline — record neutral pass-through.
+        orchestrator.record_step_result(
+            project_slug, orchestrator_step,
+            success=True, pass_rate_pct=100,
+            summary=f"skipped: runner not implemented for {framework_id}",
+            artifacts={"skipped": True},
+        )
+        return {"project": project_slug, "framework": framework_id, **result,
+                "orchestrator": orchestrator.progress_snapshot(project_slug)}
+
+    success = total > 0 and (not require_gate or pass_rate >= 60)  # gate threshold check is in orchestrator
+
+    state = orchestrator.record_step_result(
+        project_slug, orchestrator_step,
+        success=success,
+        pass_rate_pct=pass_rate,
+        summary=f"passed={result.get('passed')}/{total} ({pass_rate}%)",
+        artifacts={
+            "specs_executed": total,
+            "failed": result.get("failed"),
+            "duration_s": result.get("duration_s"),
+            "screenshots": result.get("screenshots") or [],
+            "log_tail": result.get("log_tail"),
+            "bundle_root": str(bundle_root),
+        },
+        error=None if success else (
+            f"no_tests_executed" if total == 0 else
+            f"pass_rate_below_threshold: {pass_rate}%"
+        ),
+    )
+    await _broadcast({"type": "pipeline.step_completed",
+                      "project": project_slug, "step": orchestrator_step,
+                      "state": state.current_state,
+                      "blocked_reason": state.blocked_reason,
+                      "pass_rate_pct": pass_rate})
+
+    return {
+        "project": project_slug, "framework": framework_id,
+        "step": orchestrator_step,
+        "passed": result.get("passed"), "failed": result.get("failed"),
+        "total": total, "pass_rate_pct": pass_rate,
+        "duration_s": result.get("duration_s"),
+        "screenshots": result.get("screenshots") or [],
+        "tests": result.get("tests") or [],
+        "log_tail": result.get("log_tail"),
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+    }
+
+
+@app.post("/api/ai/test-writer/smoke-run")
+async def ai_test_writer_smoke_run(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Execute the saved smoke bundle and report results — triggers SMOKE_GATE."""
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    framework_id = payload.get("framework") or "cypress-js"
+    env = (payload.get("env") or "").strip() or None
+    return await _run_bundle_step(
+        project_slug=app_index.project_slug_from(project),
+        framework_id=framework_id, step="smoke", env=env,
+        orchestrator_step="SMOKE_RUN", require_gate=True,
+    )
+
+
+@app.post("/api/ai/test-writer/e2e-run")
+async def ai_test_writer_e2e_run(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    framework_id = payload.get("framework") or "cypress-js"
+    env = (payload.get("env") or "").strip() or None
+    return await _run_bundle_step(
+        project_slug=app_index.project_slug_from(project),
+        framework_id=framework_id, step="e2e", env=env,
+        orchestrator_step="E2E_RUN", require_gate=True,
+    )
+
+
+@app.post("/api/ai/test-writer/negative-run")
+async def ai_test_writer_negative_run(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Execute negative suite. Coverage gate is checked at orchestrator level
+    (any non-zero pass rate counts as 'ran') — true failures are surfaced
+    in the per-spec results."""
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    framework_id = payload.get("framework") or "cypress-js"
+    env = (payload.get("env") or "").strip() or None
+    return await _run_bundle_step(
+        project_slug=app_index.project_slug_from(project),
+        framework_id=framework_id, step="negative", env=env,
+        orchestrator_step="NEGATIVE_RUN", require_gate=False,
+    )
+
+
+@app.post("/api/ai/test-writer/install-bundle-deps")
+async def ai_test_writer_install_bundle_deps(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """One-time install of framework deps inside a generated bundle.
+
+    The smoke/e2e/negative *_run endpoints expect the bundle to already
+    contain node_modules / .venv. Call this once per bundle to populate them.
+    """
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    framework_id = payload.get("framework") or "cypress-js"
+    env = (payload.get("env") or "").strip() or None
+    project_slug = app_index.project_slug_from(project)
+    bundle_root = _bundle_root(project_slug, framework_id, env)
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: bundle_runner.install_bundle_deps(bundle_root, framework_id),
+    )
+    return {
+        "project": project_slug, "framework": framework_id,
+        "bundle_root": str(bundle_root),
+        **result,
+    }
+
+
+@app.post("/api/ai/test-writer/api-discovery")
+async def ai_test_writer_api_discovery(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """STEP 5 — synthesize openapi.yaml from APP_INDEX.discovered_apis + traffic dump."""
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    project_slug = app_index.project_slug_from(project)
+    index = app_index.load(project_slug)
+    if index is None:
+        raise HTTPException(409, "no app_index found — run /discover first")
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(503, "ANTHROPIC_API_KEY required for api discovery")
+
+    # Pull cumulative traffic dump if present (written by /smoke-run etc).
+    traffic_path = app_index.traffic_path(project_slug)
+    traffic_dump: list[dict] = []
+    if traffic_path.exists():
+        for line in traffic_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                traffic_dump.append(json.loads(line))
+            except Exception:
+                continue
+    traffic_dump = traffic_dump[-500:]   # tail to keep prompt bounded
+
+    backend_stack = ((index.get("application") or {}).get("detected_stack") or {}).get("backend") or ""
+    auth_type = ((index.get("application") or {}).get("detected_stack") or {}).get("auth_type") or "none"
+    base_url = (index.get("application") or {}).get("base_url") or ""
+
+    orchestrator.mark_step_started(project_slug, "API_DISCOVERY")
+    await _broadcast({"type": "pipeline.step_started",
+                      "project": project_slug, "step": "API_DISCOVERY"})
+
+    loop = asyncio.get_running_loop()
+    try:
+        data = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_api_discovery(
+                project_slug=project_slug, base_url=base_url,
+                backend_stack=backend_stack, auth_type=auth_type,
+                discovered_apis=index.get("discovered_apis") or [],
+                traffic_dump=traffic_dump,
+            ),
+        )
+    except Exception as e:
+        orchestrator.record_step_result(project_slug, "API_DISCOVERY",
+            success=False, error=f"llm_failed: {type(e).__name__}: {e}")
+        raise HTTPException(502, f"api discovery failed: {e}")
+
+    yaml_text = (data.get("openapi_yaml") or "").strip()
+    if not yaml_text:
+        orchestrator.record_step_result(project_slug, "API_DISCOVERY",
+            success=False, error="no_yaml_returned")
+        raise HTTPException(502, "api discovery returned empty yaml")
+
+    # Save next to APP_INDEX.
+    out_path = app_index.index_path(project_slug).parent / "openapi.yaml"
+    out_path.write_text(yaml_text)
+
+    state = orchestrator.record_step_result(
+        project_slug, "API_DISCOVERY", success=True,
+        summary=f"operations={data.get('operations_count')}",
+        artifacts={
+            "openapi_path": str(out_path),
+            "operations_count": data.get("operations_count"),
+            "tag_counts": data.get("tag_counts") or {},
+            "auth_schemes_detected": data.get("auth_schemes_detected") or [],
+            "coverage_warnings": data.get("coverage_warnings") or [],
+        },
+    )
+    await _broadcast({"type": "pipeline.step_completed",
+                      "project": project_slug, "step": "API_DISCOVERY",
+                      "state": state.current_state})
+
+    return {
+        "project": project_slug,
+        "openapi_path": str(out_path),
+        "operations_count": data.get("operations_count"),
+        "tag_counts": data.get("tag_counts") or {},
+        "auth_schemes_detected": data.get("auth_schemes_detected") or [],
+        "coverage_warnings": data.get("coverage_warnings") or [],
+        "yaml_preview": yaml_text[:2000],
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+    }
+
+
+@app.post("/api/ai/test-writer/validate")
+async def ai_test_writer_validate(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """STEP 6 — produce the final handover doc + GREEN/YELLOW/RED verdict."""
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    project_slug = app_index.project_slug_from(project)
+    index = app_index.load(project_slug)
+    if index is None:
+        raise HTTPException(409, "no app_index found — run /discover first")
+
+    framework_id = payload.get("framework") or "cypress-js"
+    env = (payload.get("env") or "").strip() or None
+    bundle_root = _bundle_root(project_slug, framework_id, env)
+    bundle_inventory = _list_relpaths(bundle_root)
+
+    # Pull summaries from orchestrator history.
+    snap = orchestrator.progress_snapshot(project_slug)
+    history = snap.get("history") or []
+
+    def _last(step: str) -> dict:
+        for h in reversed(history):
+            if h.get("step") == step and h.get("success"):
+                return h
+        return {}
+
+    smoke = _last("SMOKE_RUN") or _last("SMOKE_GEN")
+    e2e = _last("E2E_RUN") or _last("E2E_GEN")
+    neg = _last("NEGATIVE_RUN") or _last("NEGATIVE_GEN")
+    apid = _last("API_DISCOVERY")
+
+    base_url = (index.get("application") or {}).get("base_url") or ""
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(503, "ANTHROPIC_API_KEY required for validation")
+
+    orchestrator.mark_step_started(project_slug, "VALIDATION")
+    await _broadcast({"type": "pipeline.step_started",
+                      "project": project_slug, "step": "VALIDATION"})
+
+    loop = asyncio.get_running_loop()
+    try:
+        data = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_validation(
+                project_slug=project_slug,
+                generated_at=_now_iso(), base_url=base_url,
+                app_index_obj=index,
+                smoke_summary=smoke, e2e_summary=e2e,
+                negative_summary=neg, api_discovery_summary=apid,
+                bundle_inventory=bundle_inventory,
+                risk_flags=index.get("risk_flags") or [],
+            ),
+        )
+    except Exception as e:
+        orchestrator.record_step_result(project_slug, "VALIDATION",
+            success=False, error=f"llm_failed: {type(e).__name__}: {e}")
+        raise HTTPException(502, f"validation failed: {e}")
+
+    report_md = data.get("report_md") or ""
+    if not report_md.strip():
+        orchestrator.record_step_result(project_slug, "VALIDATION",
+            success=False, error="no_report_returned")
+        raise HTTPException(502, "validation returned empty report")
+
+    out_path = app_index.index_path(project_slug).parent / "report.md"
+    out_path.write_text(report_md)
+
+    state = orchestrator.record_step_result(
+        project_slug, "VALIDATION", success=True,
+        summary=f"verdict={data.get('verdict')}",
+        artifacts={
+            "report_path": str(out_path),
+            "verdict": data.get("verdict"),
+            "verdict_reason": data.get("verdict_reason"),
+            "totals": data.get("totals") or {},
+            "top_risks": data.get("top_risks") or [],
+            "expansion_plan_summary": data.get("expansion_plan_summary") or [],
+        },
+    )
+    await _broadcast({"type": "pipeline.step_completed",
+                      "project": project_slug, "step": "VALIDATION",
+                      "state": state.current_state,
+                      "verdict": data.get("verdict")})
+
+    return {
+        "project": project_slug,
+        "report_path": str(out_path),
+        "verdict": data.get("verdict"),
+        "verdict_reason": data.get("verdict_reason"),
+        "totals": data.get("totals") or {},
+        "top_risks": data.get("top_risks") or [],
+        "expansion_plan_summary": data.get("expansion_plan_summary") or [],
+        "report_md": report_md,
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+    }
+
+
+@app.post("/api/ai/test-writer/extend")
+async def ai_test_writer_extend(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Incremental extension — user lists gaps, AI adds surgical coverage.
+
+    Body:
+      {
+        "project":    "<slug — must have existing app_index.json>",
+        "framework":  "cypress-js" ,
+        "env":        "<optional>",
+        "gaps":       ["/wallet not covered", "password reset missing", ...],
+        "rescan_urls":["http://app/wallet", ...]   # optional — re-scan these
+      }
+    """
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    project_slug = app_index.project_slug_from(project)
+    index = app_index.load(project_slug)
+    if index is None:
+        raise HTTPException(409, "no app_index found — run /discover first")
+
+    gaps = payload.get("gaps") or []
+    if not isinstance(gaps, list) or not gaps:
+        raise HTTPException(400, "gaps must be a non-empty list of strings")
+    framework_id = payload.get("framework") or "cypress-js"
+    spec = frameworks.by_id(framework_id)
+    if not spec:
+        raise HTTPException(400, f"unknown framework: {framework_id}")
+    env = (payload.get("env") or "").strip() or None
+
+    # Optional delta scan for new pages the user pointed out.
+    rescan_urls = payload.get("rescan_urls") or []
+    delta_scan: dict = {"rescanned_pages": []}
+    if rescan_urls:
+        loop = asyncio.get_running_loop()
+        auth_cfg = (index.get("auth_flow") or {}) if (index.get("auth_flow", {}).get("type") == "form") else None
+        for url in rescan_urls[:5]:    # cap to keep prompt bounded
+            try:
+                scan = await loop.run_in_executor(
+                    None,
+                    lambda u=url: test_writer.scan_page(u, auth_cfg, False, True),
+                )
+                delta_scan["rescanned_pages"].append(scan)
+            except Exception as e:
+                delta_scan["rescanned_pages"].append({"url": url, "error": str(e)})
+
+    bundle_root = _bundle_root(project_slug, framework_id, env)
+    inventory = _list_relpaths(bundle_root)
+
+    snap = orchestrator.progress_snapshot(project_slug)
+    last_validation = next(
+        (h for h in reversed(snap.get("history") or [])
+         if h.get("step") == "VALIDATION" and h.get("success")),
+        {},
+    )
+
+    base_url = (index.get("application") or {}).get("base_url") or ""
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(503, "ANTHROPIC_API_KEY required for extend")
+
+    orchestrator.mark_step_started(project_slug, "EXTEND")
+    await _broadcast({"type": "pipeline.step_started",
+                      "project": project_slug, "step": "EXTEND"})
+
+    engine_for_prompt = {
+        "cypress-js": "cypress", "cypress-ts": "cypress",
+        "playwright-js": "playwright",
+        "pytest-playwright": "pytest-playwright",
+        "robot-py": "robot", "selenium-py": "selenium",
+    }.get(framework_id, "cypress")
+
+    loop = asyncio.get_running_loop()
+    try:
+        data = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_extend(
+                project_slug=project_slug,
+                framework=engine_for_prompt, language=spec.language,
+                framework_folder=spec.folder_name, base_url=base_url,
+                app_index_obj=index, inventory=inventory, gaps=gaps,
+                delta_scan=delta_scan,
+                validation_summary=last_validation,
+            ),
+        )
+    except Exception as e:
+        orchestrator.record_step_result(project_slug, "EXTEND",
+            success=False, error=f"llm_failed: {type(e).__name__}: {e}")
+        raise HTTPException(502, f"extend failed: {e}")
+
+    new_files = data.get("new_files") or {}
+    modified_files = data.get("modified_files") or {}
+    if not new_files and not modified_files:
+        orchestrator.record_step_result(project_slug, "EXTEND",
+            success=False, error="no_changes_emitted")
+        raise HTTPException(502, "extend produced no file changes")
+
+    # Write all the files. Both new and modified files use save_bundle's
+    # write semantics — overwrite-on-collision.
+    combined = {**new_files, **modified_files}
+    try:
+        saved = test_writer.save_bundle(
+            files={str(k): str(v) for k, v in combined.items()},
+            framework=framework_id, project=project_slug, env=env,
+        )
+    except ValueError as e:
+        orchestrator.record_step_result(project_slug, "EXTEND",
+            success=False, error=f"save_failed: {e}")
+        raise HTTPException(400, str(e))
+
+    # Merge APP_INDEX patch in place.
+    patch = data.get("app_index_patch") or {}
+    if patch:
+        app_index.merge_extension(index, patch)
+        app_index.save(project_slug, index)
+
+    state = orchestrator.record_step_result(
+        project_slug, "EXTEND", success=True,
+        summary=data.get("summary") or "",
+        files_generated=len(new_files),
+        artifacts={
+            "bundle_root": saved.get("bundle_root"),
+            "new_files_count": len(new_files),
+            "modified_files_count": len(modified_files),
+            "spurious_gaps": data.get("spurious_gaps") or [],
+            "coverage_documented_skip": data.get("coverage_documented_skip") or [],
+        },
+    )
+    await _broadcast({"type": "pipeline.step_completed",
+                      "project": project_slug, "step": "EXTEND",
+                      "state": state.current_state})
+
+    return {
+        "project": project_slug, "framework": framework_id,
+        "saved": saved,
+        "summary": data.get("summary"),
+        "new_files": list(new_files.keys()),
+        "modified_files": list(modified_files.keys()),
+        "spurious_gaps": data.get("spurious_gaps") or [],
+        "coverage_documented_skip": data.get("coverage_documented_skip") or [],
+        "fragility_notes": data.get("fragility_notes") or [],
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Server-side full-pipeline orchestration.
+#
+# The frontend PipelineBoard can chain the per-step endpoints from the
+# browser, but that chain dies the moment the user closes the tab. This
+# endpoint runs the same sequence in a background task on the server so
+# long-running pipelines (15+ minutes against a real app) survive page
+# refreshes and tab closures. Progress is broadcast to anyone listening
+# on /ws.
+# ---------------------------------------------------------------------------
+
+_orchestrate_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _run_pipeline_chain(
+    project_slug: str,
+    framework_id: str,
+    mode: str,
+    url: str | None,
+    repo_url: str | None,
+    pdf_path: str | None,
+    auth_cfg: dict | None,
+    test_users: list[dict],
+    max_pages: int,
+    env: str | None,
+    stop_after: str | None,
+) -> None:
+    """Background task driving the full pipeline."""
+
+    async def _bcast(event_type: str, **kwargs) -> None:
+        await _broadcast({
+            "type": event_type,
+            "project": project_slug,
+            **kwargs,
+        })
+
+    def _stopped_after(step_name: str) -> bool:
+        return stop_after is not None and stop_after.upper() == step_name
+
+    # Define the chain. Each item: (step_name, callable, gate_blocks?)
+    spec = frameworks.by_id(framework_id)
+    if not spec:
+        await _bcast("pipeline.orchestrate_failed",
+                     reason=f"unknown framework: {framework_id}")
+        return
+
+    engine_for_prompt = {
+        "cypress-js": "cypress", "cypress-ts": "cypress",
+        "playwright-js": "playwright",
+        "pytest-playwright": "pytest-playwright",
+        "robot-py": "robot", "selenium-py": "selenium",
+        "appium-py": "appium",
+    }.get(framework_id, "cypress")
+
+    loop = asyncio.get_running_loop()
+    await _bcast("pipeline.orchestrate_started", framework=framework_id, mode=mode)
+
+    # ---- DISCOVERY -------------------------------------------------------
+    try:
+        scan: dict = {}
+        crawl_pages_list: list[dict] = []
+        git_index_text: str | None = None
+        pdf_excerpt_text: str | None = None
+
+        if mode == "product":
+            scan = await loop.run_in_executor(
+                None, lambda: test_writer.scan_page(url, auth_cfg, False, True),
+            )
+            crawl_pages_list = await loop.run_in_executor(
+                None, lambda: test_writer.crawl_pages(url, max_pages, True, auth_cfg, True),
+            )
+        elif mode == "git" and repo_url:
+            git_index_text = await loop.run_in_executor(
+                None, lambda: source_extractors.extract_git_index(repo_url),
+            )
+        elif mode == "pdf" and pdf_path:
+            pdf_excerpt_text = await loop.run_in_executor(
+                None, lambda: source_extractors.extract_pdf(pdf_path),
+            )
+
+        orchestrator.mark_step_started(project_slug, "DISCOVERY")
+        await _bcast("pipeline.step_started", step="DISCOVERY")
+        index = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_discovery(
+                project_slug=project_slug, source_mode=mode, target_url=url,
+                scan=scan, crawl_pages_list=crawl_pages_list,
+                auth_config=auth_cfg, test_users=test_users,
+                git_index=git_index_text, pdf_excerpt=pdf_excerpt_text,
+                crawl_max_pages=max_pages,
+            ),
+        )
+        index["project_slug"] = project_slug
+        app_index.save(project_slug, index)
+        seed_traffic = list(scan.get("network_requests") or [])
+        for page in crawl_pages_list or []:
+            seed_traffic.extend(page.get("network_requests") or [])
+        app_index.append_traffic(project_slug, seed_traffic)
+        state = orchestrator.record_step_result(
+            project_slug, "DISCOVERY", success=True,
+            summary=f"pages={len(index.get('pages') or [])}",
+        )
+        await _bcast("pipeline.step_completed", step="DISCOVERY",
+                     state=state.current_state, blocked_reason=state.blocked_reason)
+        if state.current_state == "BLOCKED":
+            await _bcast("pipeline.orchestrate_blocked", at="DISCOVERY",
+                         reason=state.blocked_reason)
+            return
+    except Exception as e:
+        orchestrator.record_step_result(project_slug, "DISCOVERY",
+            success=False, error=f"{type(e).__name__}: {e}")
+        await _bcast("pipeline.step_failed", step="DISCOVERY", error=str(e))
+        return
+
+    if _stopped_after("DISCOVERY"):
+        await _bcast("pipeline.orchestrate_done", stopped_at="DISCOVERY")
+        return
+
+    base_url = (
+        (index.get("application") or {}).get("base_url")
+        or url or "http://localhost:3000"
+    )
+
+    # ---- Helper to run a gen step ----------------------------------------
+    async def _gen(step_name: str, runner_fn) -> tuple[bool, dict | None]:
+        orchestrator.mark_step_started(project_slug, step_name)
+        await _bcast("pipeline.step_started", step=step_name)
+        try:
+            data = await loop.run_in_executor(None, runner_fn)
+        except Exception as e:
+            orchestrator.record_step_result(project_slug, step_name,
+                success=False, error=f"{type(e).__name__}: {e}")
+            await _bcast("pipeline.step_failed", step=step_name, error=str(e))
+            return (False, None)
+        files = data.get("files") or {}
+        if not files:
+            orchestrator.record_step_result(project_slug, step_name,
+                success=False, error="no_files_returned")
+            await _bcast("pipeline.step_failed", step=step_name, error="no_files_returned")
+            return (False, None)
+        try:
+            saved = test_writer.save_bundle(
+                files={str(k): str(v) for k, v in files.items()},
+                framework=framework_id, project=project_slug, env=env,
+            )
+        except ValueError as e:
+            orchestrator.record_step_result(project_slug, step_name,
+                success=False, error=f"save_failed: {e}")
+            await _bcast("pipeline.step_failed", step=step_name, error=f"save_failed: {e}")
+            return (False, None)
+        st = orchestrator.record_step_result(
+            project_slug, step_name, success=True,
+            summary=data.get("summary") or "",
+            files_generated=len(files),
+            artifacts={"bundle_root": saved.get("bundle_root")},
+        )
+        await _bcast("pipeline.step_completed", step=step_name,
+                     state=st.current_state, files_count=len(files))
+        return (True, data)
+
+    # ---- SMOKE_GEN -------------------------------------------------------
+    ok, _ = await _gen("SMOKE_GEN", lambda: ai_engine.run_smoke_generation(
+        project_slug=project_slug, framework=engine_for_prompt,
+        language=spec.language, framework_folder=spec.folder_name,
+        base_url=base_url,
+        app_index_slice=app_index.slice_for_prompt(index, "smoke_gen"),
+    ))
+    if not ok: return
+    if _stopped_after("SMOKE_GEN"):
+        await _bcast("pipeline.orchestrate_done", stopped_at="SMOKE_GEN"); return
+
+    # ---- SMOKE_RUN -------------------------------------------------------
+    ok = await _run_via_bundle("SMOKE_RUN", "smoke", project_slug, framework_id, env, True)
+    if not ok: return
+    if _stopped_after("SMOKE_RUN"):
+        await _bcast("pipeline.orchestrate_done", stopped_at="SMOKE_RUN"); return
+
+    # ---- E2E_GEN ---------------------------------------------------------
+    smoke_meta = _last_smoke_run(project_slug) or {}
+    bundle_root = _bundle_root(project_slug, framework_id, env)
+    existing_artifacts = _list_relpaths(bundle_root)
+    ok, _ = await _gen("E2E_GEN", lambda: ai_engine.run_e2e_generation(
+        project_slug=project_slug, framework=engine_for_prompt,
+        language=spec.language, framework_folder=spec.folder_name,
+        base_url=base_url,
+        app_index_json=app_index.slice_for_prompt(index, "e2e_gen"),
+        smoke_pass_rate=int(smoke_meta.get("pass_rate_pct") or 100),
+        smoke_duration_s=float((smoke_meta.get("finished_at") or 0) - (smoke_meta.get("started_at") or 0)),
+        smoke_spec_count=int((smoke_meta.get("artifacts") or {}).get("specs_executed") or 0),
+        existing_artifacts=existing_artifacts,
+    ))
+    if not ok: return
+    if _stopped_after("E2E_GEN"):
+        await _bcast("pipeline.orchestrate_done", stopped_at="E2E_GEN"); return
+
+    ok = await _run_via_bundle("E2E_RUN", "e2e", project_slug, framework_id, env, True)
+    if not ok: return
+    if _stopped_after("E2E_RUN"):
+        await _bcast("pipeline.orchestrate_done", stopped_at="E2E_RUN"); return
+
+    # ---- NEGATIVE_GEN + RUN ---------------------------------------------
+    smoke_filenames = _list_relpaths(bundle_root, "smoke")
+    e2e_filenames = _list_relpaths(bundle_root, "e2e")
+    ok, _ = await _gen("NEGATIVE_GEN", lambda: ai_engine.run_negative_generation(
+        project_slug=project_slug, framework=engine_for_prompt,
+        language=spec.language, framework_folder=spec.folder_name,
+        base_url=base_url,
+        app_index_json=app_index.slice_for_prompt(index, "negative_gen"),
+        smoke_filenames=smoke_filenames, e2e_filenames=e2e_filenames,
+        discovered_apis=index.get("discovered_apis") or [],
+    ))
+    if not ok: return
+    if _stopped_after("NEGATIVE_GEN"):
+        await _bcast("pipeline.orchestrate_done", stopped_at="NEGATIVE_GEN"); return
+
+    await _run_via_bundle("NEGATIVE_RUN", "negative", project_slug, framework_id, env, False)
+    if _stopped_after("NEGATIVE_RUN"):
+        await _bcast("pipeline.orchestrate_done", stopped_at="NEGATIVE_RUN"); return
+
+    # ---- API_DISCOVERY ---------------------------------------------------
+    orchestrator.mark_step_started(project_slug, "API_DISCOVERY")
+    await _bcast("pipeline.step_started", step="API_DISCOVERY")
+    try:
+        traffic_path = app_index.traffic_path(project_slug)
+        traffic_dump: list[dict] = []
+        if traffic_path.exists():
+            for line in traffic_path.read_text().splitlines():
+                line = line.strip()
+                if not line: continue
+                try: traffic_dump.append(json.loads(line))
+                except Exception: continue
+        traffic_dump = traffic_dump[-500:]
+        stack = ((index.get("application") or {}).get("detected_stack") or {})
+        api_data = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_api_discovery(
+                project_slug=project_slug, base_url=base_url,
+                backend_stack=stack.get("backend") or "",
+                auth_type=stack.get("auth_type") or "none",
+                discovered_apis=index.get("discovered_apis") or [],
+                traffic_dump=traffic_dump,
+            ),
+        )
+        yaml_text = (api_data.get("openapi_yaml") or "").strip()
+        if yaml_text:
+            (app_index.index_path(project_slug).parent / "openapi.yaml").write_text(yaml_text)
+        st = orchestrator.record_step_result(project_slug, "API_DISCOVERY",
+            success=True, summary=f"ops={api_data.get('operations_count')}")
+        await _bcast("pipeline.step_completed", step="API_DISCOVERY", state=st.current_state)
+    except Exception as e:
+        orchestrator.record_step_result(project_slug, "API_DISCOVERY",
+            success=False, error=f"{type(e).__name__}: {e}")
+        await _bcast("pipeline.step_failed", step="API_DISCOVERY", error=str(e))
+
+    if _stopped_after("API_DISCOVERY"):
+        await _bcast("pipeline.orchestrate_done", stopped_at="API_DISCOVERY"); return
+
+    # ---- VALIDATION ------------------------------------------------------
+    orchestrator.mark_step_started(project_slug, "VALIDATION")
+    await _bcast("pipeline.step_started", step="VALIDATION")
+    try:
+        snap = orchestrator.progress_snapshot(project_slug)
+
+        def _last_h(name: str) -> dict:
+            for h in reversed(snap.get("history") or []):
+                if h.get("step") == name and h.get("success"):
+                    return h
+            return {}
+
+        val_data = await loop.run_in_executor(
+            None,
+            lambda: ai_engine.run_validation(
+                project_slug=project_slug, generated_at=_now_iso(),
+                base_url=base_url, app_index_obj=index,
+                smoke_summary=_last_h("SMOKE_RUN") or _last_h("SMOKE_GEN"),
+                e2e_summary=_last_h("E2E_RUN") or _last_h("E2E_GEN"),
+                negative_summary=_last_h("NEGATIVE_RUN") or _last_h("NEGATIVE_GEN"),
+                api_discovery_summary=_last_h("API_DISCOVERY"),
+                bundle_inventory=_list_relpaths(bundle_root),
+                risk_flags=index.get("risk_flags") or [],
+            ),
+        )
+        if (val_data.get("report_md") or "").strip():
+            (app_index.index_path(project_slug).parent / "report.md").write_text(val_data["report_md"])
+        st = orchestrator.record_step_result(project_slug, "VALIDATION",
+            success=True, summary=f"verdict={val_data.get('verdict')}",
+            artifacts={"verdict": val_data.get("verdict"),
+                       "verdict_reason": val_data.get("verdict_reason")})
+        await _bcast("pipeline.step_completed", step="VALIDATION",
+                     state=st.current_state, verdict=val_data.get("verdict"))
+    except Exception as e:
+        orchestrator.record_step_result(project_slug, "VALIDATION",
+            success=False, error=f"{type(e).__name__}: {e}")
+        await _bcast("pipeline.step_failed", step="VALIDATION", error=str(e))
+
+    await _bcast("pipeline.orchestrate_done", stopped_at=None)
+
+
+async def _run_via_bundle(
+    step_name: str, sub: str, project_slug: str, framework_id: str,
+    env: str | None, require_gate: bool,
+) -> bool:
+    """Internal helper used by the background chain — runs the saved bundle's
+    smoke/e2e/negative subdir and updates orchestrator. Returns False on BLOCKED.
+
+    When the bundle hasn't had its dependencies installed yet (first run after
+    AI generated the suite), the runner returns ``install_required``. We
+    auto-install once and retry — the most common pipeline friction point.
+    """
+    bundle_root = _bundle_root(project_slug, framework_id, env)
+    orchestrator.mark_step_started(project_slug, step_name)
+    await _broadcast({"type": "pipeline.step_started",
+                      "project": project_slug, "step": step_name})
+
+    loop = asyncio.get_running_loop()
+    def _on_line(line: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            _broadcast({"type": "pipeline.run_log", "project": project_slug,
+                        "step": step_name, "line": line[:500]}),
+            loop,
+        )
+    result = await loop.run_in_executor(
+        None,
+        lambda: bundle_runner.run(bundle_root, framework_id, sub, _on_line),
+    )
+
+    if result.get("install_required"):
+        # Auto-install deps once, then retry. This is the dominant first-run
+        # failure mode — the AI just generated a fresh bundle and node_modules
+        # / .venv don't exist yet.
+        await _broadcast({"type": "pipeline.run_log",
+                          "project": project_slug, "step": step_name,
+                          "line": "[auto-install] bundle deps missing — installing once and retrying"})
+        install_res = await loop.run_in_executor(
+            None,
+            lambda: bundle_runner.install_bundle_deps(bundle_root, framework_id),
+        )
+        if not install_res.get("ok"):
+            orchestrator.record_step_result(project_slug, step_name,
+                success=False, pass_rate_pct=0,
+                error=f"install_failed: {install_res.get('log', '')[-300:]}",
+                artifacts={"install_log_tail": (install_res.get("log") or "")[-2000:]})
+            await _broadcast({"type": "pipeline.step_failed",
+                              "project": project_slug, "step": step_name,
+                              "error": "install_failed"})
+            return False
+
+        # Retry the run now that deps are installed.
+        await _broadcast({"type": "pipeline.run_log",
+                          "project": project_slug, "step": step_name,
+                          "line": "[auto-install] deps installed — re-running tests"})
+        result = await loop.run_in_executor(
+            None,
+            lambda: bundle_runner.run(bundle_root, framework_id, sub, _on_line),
+        )
+        # If install still didn't suffice, surface the failure honestly.
+        if result.get("install_required"):
+            orchestrator.record_step_result(project_slug, step_name,
+                success=False, pass_rate_pct=0,
+                error="install_required_after_retry",
+                artifacts={"runner_log": result.get("log_tail")})
+            await _broadcast({"type": "pipeline.step_failed",
+                              "project": project_slug, "step": step_name,
+                              "error": "install_required_after_retry"})
+            return False
+    if result.get("unsupported_framework"):
+        orchestrator.record_step_result(project_slug, step_name,
+            success=True, pass_rate_pct=100,
+            summary=f"skipped: runner not implemented for {framework_id}",
+            artifacts={"skipped": True})
+        return True
+
+    pass_rate = int(result.get("pass_rate_pct") or 0)
+    total = int(result.get("total") or 0)
+    success = total > 0
+    st = orchestrator.record_step_result(
+        project_slug, step_name, success=success,
+        pass_rate_pct=pass_rate,
+        summary=f"passed={result.get('passed')}/{total} ({pass_rate}%)",
+        artifacts={
+            "specs_executed": total,
+            "failed": result.get("failed"),
+            "duration_s": result.get("duration_s"),
+            "screenshots": result.get("screenshots") or [],
+            "log_tail": result.get("log_tail"),
+            "bundle_root": str(bundle_root),
+        },
+        error=None if success else "no_tests_executed",
+    )
+    await _broadcast({"type": "pipeline.step_completed", "project": project_slug,
+                      "step": step_name, "state": st.current_state,
+                      "blocked_reason": st.blocked_reason,
+                      "pass_rate_pct": pass_rate})
+    return st.current_state != "BLOCKED"
+
+
+@app.post("/api/ai/test-writer/orchestrate")
+async def ai_test_writer_orchestrate(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Kick off the full pipeline as a background server-side task.
+
+    Returns immediately with the task handle. Caller polls /state/{project}
+    or listens on /ws for progress events. Closing the browser does NOT
+    interrupt the run.
+
+    Body (most fields optional unless mode requires them):
+      {
+        "project":      "<required slug>",
+        "framework":    "cypress-js" ,
+        "env":          "<optional>",
+        "mode":         "product" | "git" | "pdf",
+        "url":          "<for product mode>",
+        "repo_url":     "<for git mode>",
+        "pdf_path":     "<for pdf mode>",
+        "auth":         {...},
+        "test_users":   [...],
+        "max_pages":    8,
+        "stop_after":   "DISCOVERY" | "SMOKE_RUN" | ...   # optional checkpoint
+      }
+    """
+    payload = payload or {}
+    project = (payload.get("project") or "").strip()
+    if not project:
+        raise HTTPException(400, "project is required")
+    project_slug = app_index.project_slug_from(project)
+
+    mode = (payload.get("mode") or "product").strip()
+    if mode not in ("product", "git", "pdf"):
+        raise HTTPException(400, "mode must be one of: product, git, pdf")
+    url = (payload.get("url") or "").strip() or None
+    repo_url = (payload.get("repo_url") or "").strip() or None
+    pdf_path = (payload.get("pdf_path") or "").strip() or None
+    if mode == "product" and not (url and url.startswith(("http://", "https://"))):
+        raise HTTPException(400, "product mode requires a url (http:// or https://)")
+    if mode == "git" and not repo_url:
+        raise HTTPException(400, "git mode requires repo_url")
+    if mode == "pdf" and not pdf_path:
+        raise HTTPException(400, "pdf mode requires pdf_path")
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(503, "ANTHROPIC_API_KEY required for orchestration")
+
+    framework_id = payload.get("framework") or "cypress-js"
+    if not frameworks.by_id(framework_id):
+        raise HTTPException(400, f"unknown framework: {framework_id}")
+
+    # Cancel any in-flight orchestration for this project to avoid double-run.
+    existing = _orchestrate_tasks.get(project_slug)
+    if existing and not existing.done():
+        existing.cancel()
+
+    task = asyncio.create_task(_run_pipeline_chain(
+        project_slug=project_slug,
+        framework_id=framework_id,
+        mode=mode, url=url, repo_url=repo_url, pdf_path=pdf_path,
+        auth_cfg=payload.get("auth"),
+        test_users=payload.get("test_users") or [],
+        max_pages=int(payload.get("max_pages") or 8),
+        env=(payload.get("env") or "").strip() or None,
+        stop_after=payload.get("stop_after"),
+    ))
+    _orchestrate_tasks[project_slug] = task
+
+    # Drop the entry once the task completes so the dict doesn't grow.
+    # The callback runs on the loop, so dict mutation is safe.
+    def _cleanup(t: asyncio.Task, slug: str = project_slug) -> None:
+        if _orchestrate_tasks.get(slug) is t:
+            _orchestrate_tasks.pop(slug, None)
+    task.add_done_callback(_cleanup)
+
+    return {
+        "project": project_slug, "framework": framework_id, "mode": mode,
+        "started": True,
+        "orchestrator": orchestrator.progress_snapshot(project_slug),
+        "subscribe_via": "/ws",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fakemail bridge — test inbox provisioning + peek
+# ---------------------------------------------------------------------------
+
+@app.get("/api/ai/fakemail/info")
+async def ai_fakemail_info(
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Return which fakemail provider QAFLOW will use given current env."""
+    provider = fakemail.discover_default_provider()
+    return {
+        "provider": provider,
+        "configured_via_env": {
+            "MAILOSAUR_API_KEY": bool(os.environ.get("MAILOSAUR_API_KEY")),
+            "IMAP_HOST": bool(os.environ.get("IMAP_HOST")),
+        },
+        "memory_fallback": provider == "memory",
+    }
+
+
+@app.get("/api/ai/fakemail/peek")
+async def ai_fakemail_peek(
+    to: str,
+    timeout_s: float = 10.0,
+    subject_contains: str | None = None,
+    provider: str | None = None,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Block (up to timeout_s) until a message for `to` is available."""
+    if not to:
+        raise HTTPException(400, "to is required")
+    try:
+        bridge = fakemail.get_bridge(provider or fakemail.discover_default_provider())
+    except Exception as e:
+        raise HTTPException(400, f"bridge init failed: {e}")
+    loop = asyncio.get_running_loop()
+    mail = await loop.run_in_executor(
+        None, lambda: bridge.peek(to, timeout_s, subject_contains),
+    )
+    if not mail:
+        return JSONResponse(status_code=404, content={"detail": "no_mail_available"})
+    return {
+        "to": mail.to, "from": mail.from_addr,
+        "subject": mail.subject,
+        "text_body": mail.text_body[:8000],
+        "html_body": mail.html_body[:8000],
+        "links": mail.extract_links(),
+        "otp": mail.extract_otp(),
+        "received_at": mail.received_at,
+        "provider": bridge.name,
+    }
+
+
+@app.post("/api/ai/fakemail/deliver")
+async def ai_fakemail_deliver(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Push a synthetic email into the in-memory bridge.
+
+    Useful for testing QAFLOW itself or building local demos that don't
+    touch real email infrastructure. Real providers (mailosaur/imap)
+    reject this with 400.
+    """
+    payload = payload or {}
+    provider = (payload.get("provider") or "memory").strip()
+    if provider != "memory":
+        raise HTTPException(400, "deliver only supported by the memory bridge")
+    to = (payload.get("to") or "").strip()
+    if not to:
+        raise HTTPException(400, "to is required")
+    bridge = fakemail.get_bridge("memory")
+    if not isinstance(bridge, fakemail.MemoryBridge):
+        raise HTTPException(500, "memory bridge missing")
+    mail = fakemail.TestMail(
+        to=to,
+        from_addr=(payload.get("from") or "noreply@qaflow.local"),
+        subject=(payload.get("subject") or ""),
+        text_body=(payload.get("text_body") or ""),
+        html_body=(payload.get("html_body") or ""),
+    )
+    bridge.deliver(mail)
+    return {"ok": True, "queued_for": to}
+
+
+@app.post("/api/ai/fakemail/provision-users")
+async def ai_fakemail_provision_users(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Build a test_users list for a given set of roles.
+
+    Body: {"roles": ["admin", "viewer", ...], "domain": "<optional>"}
+
+    Returns the list ready to be passed verbatim to /discover's test_users.
+    """
+    payload = payload or {}
+    roles = payload.get("roles") or []
+    if not isinstance(roles, list) or not roles:
+        raise HTTPException(400, "roles must be a non-empty list of strings")
+    specs = [{"role": r} for r in roles if isinstance(r, str)]
+    users = fakemail.provision_test_users(specs, domain=payload.get("domain"))
+    return {
+        "test_users": users,
+        "provider": fakemail.discover_default_provider(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Performance runner — stdlib + locust modes
+# ---------------------------------------------------------------------------
+
+@app.post("/api/ai/perf/run")
+async def ai_perf_run(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Drive throughput + latency against a URL.
+
+    stdlib mode (default):
+      {{ "mode": "stdlib", "url": "...", "method": "GET",
+         "concurrency": 10, "duration_s": 30, "headers": {{}}, "body": {{}} }}
+
+    locust mode (requires locust in the bundle .venv):
+      {{ "mode": "locust", "project": "<slug>", "framework": "pytest-playwright",
+         "locustfile": "locustfile.py",
+         "target": "http://app", "users": 50, "spawn_rate": 5, "duration_s": 60 }}
+    """
+    payload = payload or {}
+    mode = (payload.get("mode") or "stdlib").strip()
+
+    if mode == "stdlib":
+        url = (payload.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(400, "url must start with http:// or https://")
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: perf_runner.run_stdlib(
+                url=url,
+                method=payload.get("method") or "GET",
+                body=payload.get("body"),
+                headers=payload.get("headers") or {},
+                concurrency=int(payload.get("concurrency") or 10),
+                duration_s=int(payload.get("duration_s") or 30),
+            ),
+        )
+        return result
+
+    if mode == "locust":
+        project = (payload.get("project") or "").strip()
+        framework_id = payload.get("framework") or "pytest-playwright"
+        env = (payload.get("env") or "").strip() or None
+        if not project:
+            raise HTTPException(400, "project is required for locust mode")
+        bundle_root = _bundle_root(app_index.project_slug_from(project), framework_id, env)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: perf_runner.run_locust(
+                bundle_root=bundle_root,
+                locustfile=payload.get("locustfile") or "locustfile.py",
+                target=(payload.get("target") or "").strip(),
+                users=int(payload.get("users") or 50),
+                spawn_rate=int(payload.get("spawn_rate") or 5),
+                duration_s=int(payload.get("duration_s") or 60),
+            ),
+        )
+        return result
+
+    raise HTTPException(400, f"unknown mode: {mode}")
+
+
+@app.post("/api/ai/test-writer/orchestrate-cancel")
+async def ai_test_writer_orchestrate_cancel(
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    project_slug = app_index.project_slug_from((payload or {}).get("project") or "")
+    task = _orchestrate_tasks.get(project_slug)
+    if not task or task.done():
+        return {"project": project_slug, "cancelled": False, "reason": "no_active_task"}
+    task.cancel()
+    return {"project": project_slug, "cancelled": True}
+
+
+# ---------------------------------------------------------------------------
+# Project inspection — APP_INDEX viewer + file tree + bundle download
+# ---------------------------------------------------------------------------
+
+_FILE_PREVIEW_CAP_BYTES = 100_000      # max chars returned per file in /files
+
+
+@app.get("/api/ai/test-writer/projects/{project}/app-index")
+async def ai_test_writer_project_app_index(
+    project: str,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Return the persisted APP_INDEX for the project (raw JSON)."""
+    slug = app_index.project_slug_from(project)
+    idx = app_index.load(slug)
+    if idx is None:
+        raise HTTPException(404, f"no app_index for project: {slug}")
+    return {
+        "project": slug,
+        "path": str(app_index.index_path(slug)),
+        "app_index": idx,
+    }
+
+
+@app.get("/api/ai/test-writer/projects/{project}/files")
+async def ai_test_writer_project_files(
+    project: str,
+    framework: str = "cypress-js",
+    env: str | None = None,
+    include_contents: bool = True,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Return the bundle's file tree + (optional) contents.
+
+    Files larger than ``_FILE_PREVIEW_CAP_BYTES`` get content truncated to
+    keep the response small. Binary files are reported but not previewed.
+    """
+    slug = app_index.project_slug_from(project)
+    bundle_root = _bundle_root(slug, framework, env)
+    if not bundle_root.exists():
+        raise HTTPException(404, f"bundle not found at {bundle_root}")
+
+    out: list[dict] = []
+    for rel in _list_relpaths(bundle_root):
+        p = bundle_root / rel
+        size = p.stat().st_size
+        entry: dict = {
+            "path": rel,
+            "size_bytes": size,
+        }
+        if include_contents:
+            try:
+                text = p.read_text()
+                if len(text) > _FILE_PREVIEW_CAP_BYTES:
+                    entry["contents"] = text[:_FILE_PREVIEW_CAP_BYTES] + "\n…(truncated)"
+                    entry["truncated"] = True
+                else:
+                    entry["contents"] = text
+            except UnicodeDecodeError:
+                entry["binary"] = True
+            except Exception as e:
+                entry["read_error"] = f"{type(e).__name__}: {e}"
+        out.append(entry)
+
+    return {
+        "project": slug,
+        "framework": framework,
+        "env": env,
+        "bundle_root": str(bundle_root),
+        "file_count": len(out),
+        "files": out,
+    }
+
+
+@app.get("/api/ai/test-writer/projects/{project}/download")
+async def ai_test_writer_project_download(
+    project: str,
+    framework: str = "cypress-js",
+    env: str | None = None,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Stream the bundle as a ZIP archive."""
+    import io
+    import zipfile
+    from fastapi.responses import StreamingResponse
+
+    slug = app_index.project_slug_from(project)
+    bundle_root = _bundle_root(slug, framework, env)
+    if not bundle_root.exists():
+        raise HTTPException(404, f"bundle not found at {bundle_root}")
+
+    buf = io.BytesIO()
+    archive_prefix = bundle_root.name
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Bundle files
+        for rel in _list_relpaths(bundle_root):
+            zf.write(bundle_root / rel, arcname=f"{archive_prefix}/{rel}")
+        # Sidecar QAFLOW metadata (APP_INDEX, openapi, report) lives one
+        # level up under .qaflow/ — include it for traceability.
+        qaflow_dir = app_index.index_path(slug).parent
+        if qaflow_dir.exists():
+            for p in sorted(qaflow_dir.rglob("*")):
+                if p.is_file():
+                    zf.write(p, arcname=f"{archive_prefix}/.qaflow/{p.relative_to(qaflow_dir)}")
+
+    buf.seek(0)
+    filename = f"{slug}-{framework}-bundle.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/ai/test-writer/projects/{project}/report")
+async def ai_test_writer_project_report(
+    project: str,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Return the validation report.md as plain text (or 404 if not run yet)."""
+    slug = app_index.project_slug_from(project)
+    p = app_index.index_path(slug).parent / "report.md"
+    if not p.exists():
+        raise HTTPException(404, "validation report not generated yet")
+    return {"project": slug, "path": str(p), "report_md": p.read_text()}
+
+
+@app.get("/api/ai/test-writer/projects/{project}/openapi")
+async def ai_test_writer_project_openapi(
+    project: str,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Return the openapi.yaml synthesized by the api-discovery step."""
+    slug = app_index.project_slug_from(project)
+    p = app_index.index_path(slug).parent / "openapi.yaml"
+    if not p.exists():
+        raise HTTPException(404, "openapi.yaml not generated yet")
+    return {"project": slug, "path": str(p), "openapi_yaml": p.read_text()}
+
+
+@app.get("/api/ai/test-writer/state/{project}")
+async def ai_test_writer_state(
+    project: str,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Live orchestrator state for a project — polled by the UI progress board."""
+    slug = app_index.project_slug_from(project)
+    idx = app_index.load(slug)
+    return {
+        "project": slug,
+        "orchestrator": orchestrator.progress_snapshot(slug),
+        "has_app_index": idx is not None,
+        "pages_count": len((idx or {}).get("pages") or []),
+        "apis_count": len((idx or {}).get("discovered_apis") or []),
+    }
+
+
+@app.post("/api/ai/test-writer/state/{project}/retry")
+async def ai_test_writer_state_retry(
+    project: str,
+    payload: dict,
+    _user: dict = Depends(auth.require_roles("automation_engineer", "project_manager")),
+):
+    """Reset orchestrator so a specific step can be re-run."""
+    slug = app_index.project_slug_from(project)
+    step = (payload or {}).get("step", "DISCOVERY")
+    state = orchestrator.retry_step(slug, step)
+    return {"project": slug, "orchestrator": {
+        "current_state": state.current_state,
+        "blocked_reason": state.blocked_reason,
+    }}
 
 
 # ---------------------------------------------------------------------------

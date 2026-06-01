@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, HttpError } from "../api";
+import PipelineBoard from "../components/PipelineBoard";
 import type {
   AuthConfig,
   CoverageEstimate,
@@ -122,6 +123,11 @@ export default function AITestCover() {
   const [busy, setBusy] = useState<"scan" | "generate" | "save" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedPath, setSavedPath] = useState<string | null>(null);
+
+  // v2 — multi-step pipeline toggle (turns on the PipelineBoard view).
+  const [modeV2, setMode_v2] = useState(false);
+
+  const projectName = projectMode === "new" ? newProjectName : selectedProject;
 
   // Load existing projects once on mount.
   useEffect(() => {
@@ -320,14 +326,50 @@ export default function AITestCover() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold text-ink-100">AI Test Cover Engine</h1>
-        <p className="text-sm text-ink-400 mt-0.5">
-          Point at any URL, choose a framework + language, and the AI generates a
-          full automation suite tailored to the page. Black-box by default; paste
-          source or a repo URL to switch into gray/white-box.
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-ink-100">AI Test Cover Engine</h1>
+          <p className="text-sm text-ink-400 mt-0.5">
+            Point at any URL, choose a framework + language, and the AI generates a
+            full automation suite tailored to the page. Black-box by default; paste
+            source or a repo URL to switch into gray/white-box.
+          </p>
+        </div>
+        <div className="flex gap-1 rounded-md border border-ink-700 bg-ink-900/50 p-1 text-xs">
+          <button
+            type="button"
+            onClick={() => setMode_v2(false)}
+            className={
+              "rounded px-3 py-1 " +
+              (!modeV2 ? "bg-violet-500/15 text-violet-200" : "text-ink-400 hover:text-ink-100")
+            }
+          >
+            v1 — Single-shot
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode_v2(true)}
+            className={
+              "rounded px-3 py-1 " +
+              (modeV2 ? "bg-emerald-500/15 text-emerald-200" : "text-ink-400 hover:text-ink-100")
+            }
+          >
+            v2 — Multi-step Pipeline ✦
+          </button>
+        </div>
       </header>
+
+      {modeV2 && (
+        <PipelineBoard
+          project={projectName || "demo"}
+          framework={frameworkId}
+          initialUrl={url}
+          authJson={authEnabled ? JSON.stringify(authCfg) : undefined}
+        />
+      )}
+
+      {!modeV2 && (<>
+      <p className="hidden">{/* v1 UI below */}</p>
 
       {error && (
         <div className="rounded border border-rose-500/30 bg-rose-500/5 text-rose-300 px-4 py-2 text-sm">
@@ -848,6 +890,7 @@ export default function AITestCover() {
           )}
         </section>
       )}
+      </>)}
     </div>
   );
 }

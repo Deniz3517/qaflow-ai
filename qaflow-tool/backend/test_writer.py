@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -78,13 +79,76 @@ async def _scan_async(
     url: str,
     auth: dict | None = None,
     capture_baseline: bool = False,
+    capture_network: bool = False,
 ) -> dict:
+    """Scan a page with Playwright.
+
+    When ``capture_network`` is true, every request/response that fires
+    between page.goto() and browser close is collected and returned under
+    ``network_requests`` and ``console_errors``. Discovery step uses this
+    to populate APP_INDEX.discovered_apis.
+    """
     from playwright.async_api import async_playwright
+
+    network_requests: list[dict] = []
+    console_messages: list[dict] = []
+    page_errors: list[str] = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
         page = await context.new_page()
+
+        if capture_network:
+            # Request listener — synchronous, fires immediately.
+            def _on_request(req):
+                try:
+                    network_requests.append({
+                        "event": "request",
+                        "url": req.url,
+                        "method": req.method,
+                        "resource_type": req.resource_type,
+                        "headers": _truncate_headers(req.headers),
+                        "post_data": _truncate(req.post_data, 2000) if req.post_data else None,
+                        "is_navigation": req.is_navigation_request(),
+                        "ts": time.time(),
+                    })
+                except Exception:
+                    pass
+
+            async def _on_response(res):
+                try:
+                    body_snippet = None
+                    if (res.headers or {}).get("content-type", "").startswith(
+                        ("application/json", "text/plain")
+                    ):
+                        try:
+                            body = await res.text()
+                            body_snippet = _truncate(body, 1500)
+                        except Exception:
+                            body_snippet = None
+                    network_requests.append({
+                        "event": "response",
+                        "url": res.url,
+                        "status": res.status,
+                        "method": res.request.method,
+                        "resource_type": res.request.resource_type,
+                        "content_type": (res.headers or {}).get("content-type"),
+                        "body_snippet": body_snippet,
+                        "ts": time.time(),
+                    })
+                except Exception:
+                    pass
+
+            page.on("request", _on_request)
+            page.on("response", lambda res: asyncio.create_task(_on_response(res)))
+            page.on("console", lambda msg: console_messages.append({
+                "level": msg.type,
+                "text": _truncate(msg.text, 500),
+                "ts": time.time(),
+            }))
+            page.on("pageerror", lambda exc: page_errors.append(_truncate(str(exc), 500)))
+
         try:
             if auth and auth.get("kind") == "form":
                 await _login_form_flow(page, auth)
@@ -148,12 +212,40 @@ async def _scan_async(
     elements["counts"] = {k: len(v) for k, v in elements.items() if isinstance(v, list)}
     if baseline_b64:
         elements["baseline_screenshot_b64"] = baseline_b64
+    if capture_network:
+        elements["network_requests"] = network_requests
+        elements["console_messages"] = console_messages
+        elements["page_errors"] = page_errors
     return elements
 
 
 def scan_page(url: str, auth: dict | None = None,
-              capture_baseline: bool = False) -> dict:
-    return asyncio.run(_scan_async(url, auth, capture_baseline))
+              capture_baseline: bool = False,
+              capture_network: bool = False) -> dict:
+    return asyncio.run(_scan_async(url, auth, capture_baseline, capture_network))
+
+
+def _truncate(s: str | None, n: int) -> str | None:
+    if s is None:
+        return None
+    if len(s) <= n:
+        return s
+    return s[:n] + "…(truncated)"
+
+
+def _truncate_headers(headers: dict | None) -> dict:
+    """Drop noisy headers; keep auth/content/cache markers that matter to AI."""
+    if not headers:
+        return {}
+    keep = {
+        "authorization", "cookie", "content-type", "accept",
+        "x-csrf-token", "x-xsrf-token", "x-requested-with",
+        "x-api-key", "x-correlation-id",
+    }
+    return {
+        k: _truncate(v, 200) for k, v in headers.items()
+        if k.lower() in keep
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +257,7 @@ async def _crawl_async(
     max_pages: int = 8,
     same_origin: bool = True,
     auth: dict | None = None,
+    capture_network: bool = False,
 ) -> list[dict]:
     """Visit linked pages BFS up to ``max_pages``. Returns list of scan dicts."""
     visited: set[str] = set()
@@ -178,7 +271,7 @@ async def _crawl_async(
             continue
         visited.add(url)
         try:
-            scan = await _scan_async(url, auth=auth)
+            scan = await _scan_async(url, auth=auth, capture_network=capture_network)
         except Exception as e:
             pages.append({"url": url, "error": str(e), "title": None,
                           "headings": [], "buttons": [], "links": [],
@@ -200,8 +293,9 @@ async def _crawl_async(
 
 def crawl_pages(start_url: str, max_pages: int = 8,
                 same_origin: bool = True,
-                auth: dict | None = None) -> list[dict]:
-    return asyncio.run(_crawl_async(start_url, max_pages, same_origin, auth))
+                auth: dict | None = None,
+                capture_network: bool = False) -> list[dict]:
+    return asyncio.run(_crawl_async(start_url, max_pages, same_origin, auth, capture_network))
 
 
 # ---------------------------------------------------------------------------

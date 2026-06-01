@@ -16,6 +16,18 @@ cypress-tests/cypress/videos/
 cypress-tests/cypress/downloads/
 cypress-tests/results.json
 
+# --- QAFLOW v2 pipeline runtime ---
+# Per-project app_index.json, openapi.yaml, report.md, orchestrator_state.json,
+# traffic_dump.jsonl. Generated on the user's machine when they run the
+# pipeline; do not commit.
+tests/*/.qaflow/
+
+# Generated test-bundle deps + JUnit/Robot artifacts.
+tests/*/*/node_modules/
+tests/*/*/.venv/
+tests/*/*/.qaflow_*.xml
+tests/*/*/.qaflow_robot_out/
+
 # --- buggy-app is its own GitHub repo ---
 buggy-app/
 

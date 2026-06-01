@@ -269,6 +269,65 @@ export interface InstallStatus {
   duration_s?: number;
 }
 
+// ---------------------------------------------------------------------------
+// AI Test Cover v2 — multi-step pipeline
+// ---------------------------------------------------------------------------
+
+export type PipelineState =
+  | "INIT" | "DISCOVERY"
+  | "SMOKE_GEN" | "SMOKE_RUN" | "SMOKE_GATE"
+  | "E2E_GEN"   | "E2E_RUN"   | "E2E_GATE"
+  | "NEGATIVE_GEN" | "NEGATIVE_RUN"
+  | "API_DISCOVERY" | "VALIDATION"
+  | "DONE" | "BLOCKED" | "EXTEND";
+
+export interface PipelineHistoryEntry {
+  step: PipelineState;
+  success: boolean | null;
+  started_at: number;
+  finished_at: number | null;
+  summary?: string;
+  pass_rate_pct?: number | null;
+  files_generated?: number | null;
+  error?: string | null;
+  artifacts?: Record<string, unknown>;
+}
+
+export interface PipelineSnapshot {
+  project_slug: string;
+  current_state: PipelineState;
+  blocked_reason: string | null;
+  is_terminal: boolean;
+  history: PipelineHistoryEntry[];
+  thresholds: { smoke_gate_pct: number; e2e_gate_pct: number };
+}
+
+export interface PipelineStepResult {
+  project: string;
+  framework: string;
+  saved: SavedBundle;
+  summary?: string;
+  files: string[];
+  expected_pass_rate_pct?: number;
+  fragility_notes?: string[];
+  orchestrator: PipelineSnapshot;
+}
+
+export interface PipelineRunResult {
+  project: string;
+  framework: string;
+  step: PipelineState;
+  passed: number;
+  failed: number;
+  total: number;
+  pass_rate_pct: number;
+  duration_s?: number;
+  screenshots: string[];
+  tests: Array<{ name: string; status: "pass" | "fail" | "pending"; duration_ms?: number | null }>;
+  log_tail?: string;
+  orchestrator: PipelineSnapshot;
+}
+
 export type CypressTestStatus = "pass" | "fail" | "pending";
 export interface CypressTest {
   spec: string | null;

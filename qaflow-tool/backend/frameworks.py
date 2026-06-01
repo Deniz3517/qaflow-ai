@@ -141,6 +141,28 @@ REGISTRY: list[FrameworkSpec] = [
         check_argv=[".venv/bin/pytest", "--version"],
         description="Pytest + Selenium WebDriver — classic pairing for cross-browser flows.",
     ),
+    FrameworkSpec(
+        id="appium-py",
+        name="Appium (Mobile)",
+        language="python",
+        extension=".py",
+        workspace_rel="test-frameworks/appium-py",
+        specs_subdir="tests",
+        folder_name="appium",
+        install_steps=[
+            ["python3", "-m", "venv", ".venv"],
+            [".venv/bin/pip", "install", "--quiet", "--upgrade", "pip"],
+            [".venv/bin/pip", "install", "--quiet",
+             "pytest", "Appium-Python-Client", "selenium"],
+        ],
+        check_argv=[".venv/bin/python", "-c",
+                    "import appium; print('Appium', getattr(appium, '__version__', '?'))"],
+        description=(
+            "Mobile-flow runner. Picked by orchestrator when APP_INDEX."
+            "mobile_relevant is true. Requires an Appium server running locally "
+            "(brew install appium) and platform tools (adb / Xcode) on the host."
+        ),
+    ),
 ]
 
 

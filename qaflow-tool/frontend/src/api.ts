@@ -7,6 +7,9 @@ import type {
   DashboardSummary,
   InstallStatus,
   ManualBug,
+  PipelineRunResult,
+  PipelineSnapshot,
+  PipelineStepResult,
   QualityScore,
   RegenDiff,
   Run,
@@ -143,6 +146,218 @@ export const api = {
   installStatus: (id: string) =>
     http<InstallStatus>(`/api/ai/test-writer/frameworks/${id}/install-status`),
   screenshotUrl: (name: string) => `/api/screenshots/${name}`,
+
+  // ---- AI Test Cover v2 — multi-step pipeline (discovery/smoke/e2e/negative/api/validate/extend)
+  pipelineDiscover: (payload: {
+    project: string; mode: "product" | "git" | "pdf";
+    url?: string; repo_url?: string; pdf_path?: string;
+    auth?: AuthConfig; test_users?: Array<Record<string, unknown>>;
+    max_pages?: number;
+  }) =>
+    http<{
+      project: string; app_index: Record<string, unknown>;
+      orchestrator: PipelineSnapshot;
+    }>("/api/ai/test-writer/discover", { method: "POST", body: JSON.stringify(payload) }),
+
+  pipelineSmoke: (payload: { project: string; framework: string; env?: string }) =>
+    http<PipelineStepResult>("/api/ai/test-writer/smoke", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  pipelineE2E: (payload: { project: string; framework: string; env?: string; force?: boolean }) =>
+    http<PipelineStepResult>("/api/ai/test-writer/e2e", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  pipelineNegative: (payload: { project: string; framework: string; env?: string; force?: boolean }) =>
+    http<PipelineStepResult>("/api/ai/test-writer/negative", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+
+  pipelineSmokeRun: (payload: { project: string; framework: string; env?: string }) =>
+    http<PipelineRunResult>("/api/ai/test-writer/smoke-run", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  pipelineE2ERun: (payload: { project: string; framework: string; env?: string }) =>
+    http<PipelineRunResult>("/api/ai/test-writer/e2e-run", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  pipelineNegativeRun: (payload: { project: string; framework: string; env?: string }) =>
+    http<PipelineRunResult>("/api/ai/test-writer/negative-run", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+
+  pipelineApiDiscovery: (payload: { project: string }) =>
+    http<{
+      project: string; openapi_path: string; operations_count: number;
+      tag_counts: Record<string, number>; auth_schemes_detected: string[];
+      coverage_warnings: string[]; yaml_preview: string;
+      orchestrator: PipelineSnapshot;
+    }>("/api/ai/test-writer/api-discovery", { method: "POST", body: JSON.stringify(payload) }),
+
+  pipelineValidate: (payload: { project: string; framework: string; env?: string }) =>
+    http<{
+      project: string; report_path: string; verdict: "GREEN" | "YELLOW" | "RED";
+      verdict_reason: string;
+      totals: Record<string, Record<string, number>>;
+      top_risks: string[];
+      expansion_plan_summary: Array<{ priority: string; description: string; effort: string }>;
+      report_md: string;
+      orchestrator: PipelineSnapshot;
+    }>("/api/ai/test-writer/validate", { method: "POST", body: JSON.stringify(payload) }),
+
+  pipelineExtend: (payload: {
+    project: string; framework: string; env?: string;
+    gaps: string[]; rescan_urls?: string[];
+  }) =>
+    http<PipelineStepResult & {
+      new_files: string[]; modified_files: string[];
+      spurious_gaps: Array<{ gap: string; reason: string }>;
+      coverage_documented_skip: Array<{ gap: string; reason: string }>;
+    }>("/api/ai/test-writer/extend", { method: "POST", body: JSON.stringify(payload) }),
+
+  pipelineState: (project: string) =>
+    http<{
+      project: string;
+      orchestrator: PipelineSnapshot;
+      has_app_index: boolean;
+      pages_count: number;
+      apis_count: number;
+    }>(`/api/ai/test-writer/state/${encodeURIComponent(project)}`),
+
+  pipelineProjectAppIndex: (project: string) =>
+    http<{ project: string; path: string; app_index: Record<string, unknown> }>(
+      `/api/ai/test-writer/projects/${encodeURIComponent(project)}/app-index`,
+    ),
+
+  pipelineProjectFiles: (project: string, framework: string, env?: string) =>
+    http<{
+      project: string; framework: string; env: string | null;
+      bundle_root: string; file_count: number;
+      files: Array<{
+        path: string; size_bytes: number;
+        contents?: string; truncated?: boolean; binary?: boolean; read_error?: string;
+      }>;
+    }>(
+      `/api/ai/test-writer/projects/${encodeURIComponent(project)}/files` +
+      `?framework=${encodeURIComponent(framework)}${env ? `&env=${encodeURIComponent(env)}` : ""}`,
+    ),
+
+  pipelineProjectDownloadUrl: (project: string, framework: string, env?: string): string =>
+    `/api/ai/test-writer/projects/${encodeURIComponent(project)}/download` +
+    `?framework=${encodeURIComponent(framework)}${env ? `&env=${encodeURIComponent(env)}` : ""}`,
+
+  pipelineProjectReport: (project: string) =>
+    http<{ project: string; path: string; report_md: string }>(
+      `/api/ai/test-writer/projects/${encodeURIComponent(project)}/report`,
+    ),
+
+  pipelineProjectOpenapi: (project: string) =>
+    http<{ project: string; path: string; openapi_yaml: string }>(
+      `/api/ai/test-writer/projects/${encodeURIComponent(project)}/openapi`,
+    ),
+
+  aiAuditLog: (limit = 50, event_type?: string) =>
+    http<{
+      stats: {
+        calls?: number; successes?: number; cache_hits?: number;
+        avg_duration_ms?: number;
+        oldest?: number; newest?: number; window_s?: number;
+        by_engine?: Record<string, number>;
+      };
+      items: Array<{
+        id: number; ts: number; event_type: string;
+        bug_uid?: string | null;
+        framework_id?: string | null;
+        engine?: string | null;
+        cache_hit: number;
+        success: number;
+        duration_ms?: number | null;
+        summary?: string | null;
+        error?: string | null;
+      }>;
+    }>(
+      `/api/ai/audit?limit=${limit}${event_type ? `&event_type=${encodeURIComponent(event_type)}` : ""}`,
+    ),
+
+  pipelineRetryStep: (project: string, step: string) =>
+    http<{ project: string; orchestrator: { current_state: string; blocked_reason: string | null } }>(
+      `/api/ai/test-writer/state/${encodeURIComponent(project)}/retry`,
+      { method: "POST", body: JSON.stringify({ step }) },
+    ),
+
+  pipelineInstallBundleDeps: (payload: { project: string; framework: string; env?: string }) =>
+    http<{ project: string; framework: string; bundle_root: string; ok: boolean; log: string }>(
+      "/api/ai/test-writer/install-bundle-deps",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  pipelineOrchestrate: (payload: {
+    project: string;
+    framework: string;
+    mode: "product" | "git" | "pdf";
+    url?: string; repo_url?: string; pdf_path?: string;
+    auth?: AuthConfig;
+    test_users?: Array<Record<string, unknown>>;
+    max_pages?: number;
+    env?: string;
+    stop_after?: string;
+  }) =>
+    http<{
+      project: string; framework: string; mode: string; started: boolean;
+      orchestrator: PipelineSnapshot; subscribe_via: string;
+    }>("/api/ai/test-writer/orchestrate", { method: "POST", body: JSON.stringify(payload) }),
+
+  pipelineOrchestrateCancel: (project: string) =>
+    http<{ project: string; cancelled: boolean }>(
+      "/api/ai/test-writer/orchestrate-cancel",
+      { method: "POST", body: JSON.stringify({ project }) },
+    ),
+
+  // ---- Fakemail bridge
+  fakemailInfo: () =>
+    http<{ provider: string; configured_via_env: Record<string, boolean>; memory_fallback: boolean }>(
+      "/api/ai/fakemail/info",
+    ),
+  fakemailProvisionUsers: (roles: string[], domain?: string) =>
+    http<{
+      test_users: Array<{ role: string; email: string; password: string; inbox_url: string }>;
+      provider: string;
+    }>("/api/ai/fakemail/provision-users", {
+      method: "POST", body: JSON.stringify({ roles, domain }),
+    }),
+  fakemailPeek: (to: string, opts?: { timeout_s?: number; subject_contains?: string }) =>
+    http<{
+      to: string; from: string; subject: string;
+      text_body: string; html_body: string;
+      links: string[]; otp: string | null;
+      received_at: number; provider: string;
+    }>(
+      `/api/ai/fakemail/peek?to=${encodeURIComponent(to)}${
+        opts?.timeout_s ? `&timeout_s=${opts.timeout_s}` : ""
+      }${opts?.subject_contains ? `&subject_contains=${encodeURIComponent(opts.subject_contains)}` : ""}`,
+    ),
+
+  // ---- Performance runner
+  perfRun: (payload: {
+    mode?: "stdlib" | "locust";
+    url?: string;
+    method?: string;
+    body?: Record<string, unknown>;
+    headers?: Record<string, string>;
+    concurrency?: number;
+    duration_s?: number;
+    project?: string;
+    framework?: string;
+    locustfile?: string;
+    target?: string;
+    users?: number;
+    spawn_rate?: number;
+  }) =>
+    http<{
+      mode: string; target: string; duration_s: number;
+      requests_total: number; requests_per_sec: number;
+      errors: number;
+      p50_ms: number | null; p95_ms: number | null; p99_ms: number | null;
+    }>("/api/ai/perf/run", { method: "POST", body: JSON.stringify(payload) }),
 
   // ---- manual bugs
   listManualBugs: (scope?: string) =>

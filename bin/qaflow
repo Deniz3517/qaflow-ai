@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# qaflow — convenience shim that invokes the CLI inside the backend venv.
+#
+# Usage from anywhere:
+#   ./bin/qaflow discover --project demo --url http://localhost:3001/login.html
+#   ./bin/qaflow run-all  --project demo --url ...
+#
+# Resolves paths relative to its own location so the script works whether
+# invoked via `./bin/qaflow ...` from the repo root, an absolute path, or
+# a symlink in $PATH.
+
+set -e
+
+# Resolve real script directory, even when invoked via a symlink.
+SCRIPT_PATH="$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BACKEND_DIR="$REPO_ROOT/qaflow-tool/backend"
+
+if [ ! -x "$BACKEND_DIR/.venv/bin/python" ]; then
+  echo "ERROR: backend .venv not found at $BACKEND_DIR/.venv" >&2
+  echo "Run ./start.sh once to bootstrap, or create the venv manually:" >&2
+  echo "  cd $BACKEND_DIR && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+  exit 3
+fi
+
+# Run the CLI under the backend's venv with backend on sys.path.
+cd "$BACKEND_DIR"
+exec "$BACKEND_DIR/.venv/bin/python" qaflow_cli.py "$@"
